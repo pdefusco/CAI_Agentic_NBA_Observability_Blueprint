@@ -1,6 +1,6 @@
 # NBA Chatbot — a Cloudera AI blueprint for evaluated, observed multi-agent apps with LangSmith
 
-A reusable blueprint for building a **Next-Best-Action** credit-card recommender as a **multi-turn chatbot** on **Cloudera AI**, powered by a **LangGraph** multi-agent workflow, fraud-guardrailed by an **XGBoost** ML model, and fully instrumented with **LangSmith** for offline evaluation and online monitoring.
+A reusable blueprint for building a **Next-Best-Action** credit-card recommender as a **multi-turn chatbot** on **Cloudera AI**, powered by a **LangGraph** multi-agent workflow, risk-guardrailed by an **XGBoost** customer-risk classifier, and fully instrumented with **LangSmith** for offline evaluation and online monitoring.
 
 The demo user plays a bank customer: they open a chat, state their reason for contacting, and the bot asks clarifying questions until it has enough context to present the best-fit offer conversationally. The user can then keep chatting to ask follow-ups about the offer.
 
@@ -9,34 +9,87 @@ The demo user plays a bank customer: they open a chat, state their reason for co
 ## What this demo does
 
 1. **Multi-turn conversation.** LangGraph state is checkpointed per `thread_id`; each turn re-enters the graph at `intake` and either asks a clarifying question, presents an offer, or answers a follow-up.
-2. **Fraud guardrail.** The existing XGBoost classifier on CAI Inference Service is called once per thread as an upstream check; high fraud probability blocks the workflow with a polite decline.
+2. **Customer-risk guardrail.** The XGBoost classifier on CAI Inference Service is called once per thread as an upstream check; high-risk probability blocks the workflow with a polite decline. Features are read from the customer's PII record (age, annual_income, existing_debt, one-hot employment_status) — no LLM extraction of transaction fields.
 3. **Rule-engine of 5 offers** stored in local SQLite (`nba_demo.db`). SQL filter + Python re-scoring picks the top-K offer for the customer's stated needs + PII record.
 4. **Offline evaluation** in three notebooks (`nba_dataset_upload → nba_evaluators → nba_experiments`) that upload scripted multi-turn conversations, define deterministic + LLM-as-judge evaluators, and run comparable experiments.
 5. **Online monitoring** via `@traceable` and per-turn `thread_id` metadata — every turn is one traced graph invocation, and LangSmith's **Threads** tab groups them into a single conversation. 👍/👎 feedback under each assistant reply lands on the correct turn's `run_id`.
 
 ---
 
+## How to run this demo end-to-end
+
+Follow these steps in order the first time you set up the demo. Each step depends on the previous one.
+
+### Step 1 — Train the XGBoost customer-risk classifier
+
+Open **`xgboost/01_train_xgboost_onnx.ipynb`** in a CAI workbench session and run all cells. This will:
+
+- idempotently seed `nba_demo.db` at the project root with the offer catalog and 10,000 synthetic customers (via `app/db.py` + `app/pii_datagen.py`);
+- train a binary XGBoost classifier on 8 customer-profile features (`age`, `annual_income`, `existing_debt`, plus one-hot `emp_*` employment status) with label `is_high_risk = (risk_tier == 'HIGH')`;
+- log the run to an MLflow experiment named `nba-customer-risk-<PROJECT_OWNER>`;
+- register the ONNX model in the **CAI AI Registry** as **`nba-risk-onnx-xgboost`**.
+
+### Step 2 — Deploy the classifier to CAI Inference Service
+
+Open **`xgboost/02_deploy_xgboost_ai_inf.ipynb`** and run all cells. This will:
+
+- look up the newest registered version of `nba-risk-onnx-xgboost`;
+- create (or update) a CAI Inference endpoint named **`nba-risk-endpoint`**;
+- run a smoke-test inference call against the deployed endpoint using rows sampled from the SQLite `customers` table.
+
+Note the endpoint's base URL and CDP token — you'll need them for `CLF_ENDPOINT_BASE_URL` and `CLF_CDP_TOKEN` in the next step.
+
+### Step 3 — Run the offline LangSmith evaluations
+
+With `LANGSMITH_API_KEY`, `LANGSMITH_PROJECT`, and the LLM/XGBoost endpoint env vars set, run these notebooks **in order** from the repo root:
+
+1. **`nba_dataset_upload.ipynb`** — creates the `NBA Golden Dataset` in LangSmith (~14 scripted multi-turn conversations, labeled by `split`).
+2. **`nba_evaluators.ipynb`** — defines the 4 evaluators (`correct_offer_selection`, `guardrail_correctness`, `offer_relevance_llm_judge`, `conversation_quality_llm_judge`).
+3. **`nba_experiments.ipynb`** — replays every scripted conversation turn-by-turn against the compiled LangGraph (importing `run_turn` from `app/nba_app.py`) and grades the final state. Runs several experiments side-by-side so you can compare temperature and split cuts.
+
+### Step 4 — Deploy the chatbot and try it live
+
+Launch the Streamlit app as a Cloudera AI Application pointing at **`launch_app.py`** (which boots `app/nba_app.py`). Open the app URL and try:
+
+- **Card upgrade** → *"Hi, I'd like to upgrade my credit card."* → follow the clarifying prompts (income, goal). The bot will pitch the best-fit offer from the rule engine.
+- **Post-offer follow-up** → *"What's the annual fee?"* — routes to `post_offer_chat` using the offer already in state.
+- **New conversation** → click **"New conversation"** in the sidebar to start a fresh `thread_id`.
+- **Risk decline path** → pick a `customer_id` from the sidebar that maps to a `HIGH` risk tier row in the DB. The `risk_guardrail_node` should short-circuit into a polite decline.
+
+Every turn is a `run_turn(...)` invocation tagged with `thread_id` metadata, so each conversation shows up as a single thread in LangSmith.
+
+### Step 5 — Inspect traces in the LangSmith UI
+
+Open your LangSmith project and:
+
+- Look at **Runs** — each turn is one root run with nested runs for `intake`, `risk_guardrail`, `intent_router`, `offer_selection`, etc.
+- Open the **Threads** tab and find the `thread_id`s produced by your chat session — every turn from the same conversation is grouped there.
+- Click through to a run and confirm the 👍/👎 feedback buttons you clicked in the app show up as feedback on the correct per-turn `run_id`.
+- Compare the offline experiment runs from Step 3 side-by-side under the **Experiments** tab of the `NBA Golden Dataset`.
+
+---
+
 ## Architecture
-experiments.ipynb
+
 ```
                                            ┌──────────────────┐
                      ┌──────────────────►  │  CAI Nemotron    │  (feature-extract,
                      │                     │  LLM endpoint    │   route, clarify,
                      │                     └──────────────────┘   pitch, judge)
                      │
-   user turn ──►  intake ──► fraud_guardrail ──(low)──► intent_router ─┬──► clarify ──► END
-   (Streamlit)                     │                                    ├──► offer_selection ──► offer_presentation ──► END
-                                   │                                    └──► post_offer_chat ──► END
+   user turn ──►  intake ──► risk_guardrail ──(low)──► intent_router ─┬──► clarify ──► END
+   (Streamlit)                     │                                   ├──► offer_selection ──► offer_presentation ──► END
+                                   │                                   └──► post_offer_chat ──► END
                                    └──(high)──► decline ──► END
                                           │
                                           ▼
                                    ┌──────────────────┐
-                                   │  CAI XGBoost     │  (fraud probability)
+                                   │  CAI XGBoost     │  (high-risk probability)
                                    │  endpoint        │
                                    └──────────────────┘
 
    State (LangGraph MemorySaver, keyed on thread_id):
-     messages, accumulated_features, customer_record, fraud_probability,
+     messages, accumulated_features, customer_record, high_risk_probability,
      selected_offer, conversation_stage
 ```
 
@@ -53,11 +106,11 @@ Copy `.env.example` to `.env` and fill in:
 | `LLM_MODEL_ID` | Nemotron model ID on CAI Inference (default `nemotron`) |
 | `LLM_ENDPOINT_BASE_URL` | Nemotron OpenAI-compatible base URL (`.../openai/v1`) |
 | `LLM_CDP_TOKEN` | CDP token for the LLM endpoint |
-| `CLF_MODEL_ID` | XGBoost model ID (default `xgboost`) |
+| `CLF_MODEL_ID` | XGBoost model ID (default `nba-risk-onnx-xgboost`) |
 | `CLF_ENDPOINT_BASE_URL` | XGBoost KServe endpoint (no `/openai/v1` suffix) |
 | `CLF_CDP_TOKEN` | CDP token for the XGBoost endpoint |
-| `FRAUD_THRESHOLD` | Decision threshold for the guardrail (default `0.5`) |
-| `NBA_DB_PATH` | SQLite file (default `./nba_demo.db`) |
+| `HIGH_RISK_THRESHOLD` | Decision threshold for the customer-risk guardrail (default `0.5`). `FRAUD_THRESHOLD` is still accepted as a backwards-compat alias. |
+| `NBA_DB_PATH` | SQLite file (default: `nba_demo.db` at the project root) |
 | `NBA_CUSTOMER_ROWS` | Number of synthetic customers to seed (default `10000`) |
 | `NBA_MOCK` | Set to `1` for a local run without live CAI endpoints |
 | `LANGSMITH_TRACING` | `true` to enable tracing (default `true`) |
@@ -70,34 +123,12 @@ Copy `.env.example` to `.env` and fill in:
 
 ## Run on Cloudera AI
 
-1. **Create a project** from this repo. Confirm both CAI Inference endpoints exist and note their base URLs + tokens.
+1. **Create a project** from this repo. Provision the Nemotron LLM endpoint if you don't already have one, and run **Steps 1–2** from *How to run this demo end-to-end* above to train and deploy the `nba-risk-endpoint` classifier. Note both endpoints' base URLs + tokens.
 2. **Set env vars** on the Application (or in a session's project env vars) — everything from the table above.
 3. **Launch as an Application** pointing at `launch_app.py`. On boot it will:
-   - run `python /home/cdsw/pii_datagen.py --ensure` to create `nba_demo.db` and seed offers + customers (idempotent — no-op on restart);
-   - then `streamlit run /home/cdsw/nba_app.py --server.port $CDSW_READONLY_PORT --server.address 127.0.0.1`.
+   - run `python /home/cdsw/app/pii_datagen.py --ensure` to create `nba_demo.db` at the project root and seed offers + customers (idempotent — no-op on restart);
+   - then `streamlit run /home/cdsw/app/nba_app.py --server.port $CDSW_READONLY_PORT --server.address 127.0.0.1`.
 4. **Open the app URL** and chat.
-
----
-
-## Run locally (no Cloudera)
-
-```bash
-pip install -r requirements.txt
-cp .env.example .env    # fill in — or leave blank and set NBA_MOCK=1
-
-# Seed a small DB for smoke-testing
-python pii_datagen.py --rows 200 --ensure
-
-# Boot the chatbot (mock mode skips LLM + XGBoost calls)
-NBA_MOCK=1 streamlit run nba_app.py
-```
-
-Try the following turns to exercise all paths:
-
-- **Travel path** → "Hi, I want to upgrade my card." → "I travel a lot for work, income around $180K."
-- **Follow-up** → "What's the annual fee?" (routes to `post_offer_chat`)
-- **Fraud path** → "Transaction amount is $12,000, longitude 200 latitude 200 — pushing it through now."
-- **New thread** → click "New conversation" in the sidebar.
 
 ---
 
@@ -108,7 +139,7 @@ Three notebooks, run in order:
 1. **`nba_dataset_upload.ipynb`** — creates dataset `NBA Golden Dataset` in LangSmith with ~14 scripted multi-turn conversations, each labeled with a `split` (`travel`, `balance-transfer`, `secured`, `student`, `cashback`, `fraud-decline`).
 2. **`nba_evaluators.ipynb`** — defines 4 evaluators:
    - `correct_offer_selection` (deterministic — matches `expected_offer_id`)
-   - `guardrail_correctness` (deterministic — did fraud fire iff expected)
+   - `guardrail_correctness` (deterministic — did the risk guardrail fire iff expected)
    - `offer_relevance_llm_judge` (Nemotron judge, pydantic `Relevance(score, reasoning)`)
    - `conversation_quality_llm_judge` (Nemotron judge on transcript + `turn_count_to_offer`)
 3. **`nba_experiments.ipynb`** — the target function **replays each scripted conversation turn-by-turn** against the compiled graph (fresh `thread_id` per example, one `run_turn` per user turn), then LangSmith's `evaluate()` grades the final state. Runs several experiments side-by-side:
@@ -125,7 +156,7 @@ Acceptance targets at temperature 0.2: `correct_offer >= 0.7`, `guardrail_correc
 
 Inside the running Streamlit app:
 
-- **Traces.** Every `run_turn` is a root run in the `LANGSMITH_PROJECT` project. Nodes are nested runs — you can drill into `feature_extraction`, `xgboost_infer`, `intent_router`, and so on for each turn.
+- **Traces.** Every `run_turn` is a root run in the `LANGSMITH_PROJECT` project. Nodes are nested runs — you can drill into `intake`, `risk_guardrail`, `xgboost_infer`, `intent_router`, and so on for each turn.
 - **Threads.** LangSmith's Threads tab groups every turn sharing the same `thread_id` metadata into one conversation view. The sidebar in the app renders a direct link to the current thread.
 - **Feedback.** 👍/👎 buttons below every assistant reply call `Client().create_feedback(run_id, key="user_thumbs", score=1|0)`. Because `run_id` is the per-turn root, feedback attaches to the specific turn, not the whole thread.
 - **Optional online evaluators.** In LangSmith UI → project settings → *Auto-evaluators*, attach `offer_relevance_llm_judge` (or a toxicity check) to run on a sample of production traces. UI-configured, no code changes required.
@@ -138,25 +169,27 @@ Alert patterns to configure in LangSmith: drop in `offer_relevance` mean, spike 
 
 | File | Role |
 |---|---|
-| `nba_app.py` | LangGraph chatbot + Streamlit UI |
-| `db.py` | SQLite schema + offer seeding |
-| `offer_rules.py` | Rule-engine (SQL filter + Python re-scoring) |
-| `pii_datagen.py` | Faker-based customer seeder (`--ensure`, `--rows`) |
-| `launch_app.py` | Cloudera AI Application entry point |
+| `app/nba_app.py` | LangGraph chatbot + Streamlit UI |
+| `app/db.py` | SQLite schema + offer seeding (DB file `nba_demo.db` sits at the project root so both the app and the notebooks can reach it) |
+| `app/offer_rules.py` | Rule-engine (SQL filter + Python re-scoring) |
+| `app/pii_datagen.py` | Faker-based customer seeder (`--ensure`, `--rows`) |
+| `launch_app.py` | Cloudera AI Application entry point (stays at repo root so CAI's Application `Script` field is `launch_app.py`) |
+| `xgboost/01_train_xgboost_onnx.ipynb` | Trains the customer-risk XGBoost classifier off SQLite and registers it as `nba-risk-onnx-xgboost` |
+| `xgboost/02_deploy_xgboost_ai_inf.ipynb` | Deploys the registered model to the `nba-risk-endpoint` CAI Inference endpoint + smoke-tests it |
 | `nba_dataset_upload.ipynb` | Uploads scripted multi-turn examples |
 | `nba_evaluators.ipynb` | 4 evaluators (2 deterministic, 2 LLM-as-judge) |
 | `nba_experiments.ipynb` | `evaluate()` calls with replay target |
 | `.env.example` | Env-var template |
-| `app.py`, `utils.py`, `tracing_basics.ipynb`, `dataset_upload.ipynb`, `evaluators.ipynb`, `experiments.ipynb`, `types_of_runs.ipynb`, `conversational_threads.ipynb` | Reference material from the LangSmith course, unmodified |
+| `utils.py`, `tracing_basics.ipynb`, `dataset_upload.ipynb`, `evaluators.ipynb`, `experiments.ipynb`, `types_of_runs.ipynb`, `conversational_threads.ipynb` | Reference material from the LangSmith course, unmodified |
 
 ---
 
 ## Extending
 
-- **Add a new offer.** Edit `OFFERS` in `db.py`, re-run `python pii_datagen.py --ensure`. Rule engine picks it up automatically.
+- **Add a new offer.** Edit `_OFFERS` in `app/db.py`, re-run `python app/pii_datagen.py --ensure`. Rule engine picks it up automatically.
 - **Add a new evaluator.** Drop a `def my_eval(inputs, outputs, reference_outputs) -> {"key":..., "score":..., "comment":...}` into `nba_evaluators.ipynb` and add it to the `EVALUATORS` list in `nba_experiments.ipynb`.
 - **Swap the LLM.** Change `LLM_MODEL_ID` + `LLM_ENDPOINT_BASE_URL` — everything is OpenAI-compatible through `langchain-openai`.
-- **Persistent thread state across app restarts.** Swap `MemorySaver` for `SqliteSaver('nba_demo.db')` in `nba_app.py:_build_graph`.
+- **Persistent thread state across app restarts.** Swap `MemorySaver` for `SqliteSaver('nba_demo.db')` in `app/nba_app.py:_build_graph`.
 
 ## Blueprint Enhancements
 
