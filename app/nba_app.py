@@ -662,7 +662,25 @@ def intent_router_node(state: GraphState) -> Dict[str, Any]:
     # + partial features, so we'd rather present a best-guess offer than loop
     # forever.  Deliberately unconditional on ``stage`` so a mis-typed LLM
     # response can't slip past the cap.
-    clarify_count = _count_clarify_turns(state.get("messages", []))
+    #
+    # Source of truth: the explicit ``clarify_count`` state field that
+    # ``clarify_node`` increments every time it asks a question.  We *also*
+    # scan the transcript as a belt-and-suspenders fallback in case the
+    # counter was lost across a checkpointer round-trip — some LangGraph
+    # versions deserialize BaseMessage subclasses as dicts, which would
+    # silently zero out a pure ``_count_clarify_turns``-based counter (this
+    # is the bug that let the chatbot loop for 8 turns previously).
+    stored = state.get("clarify_count") or 0
+    scanned = _count_clarify_turns(state.get("messages", []))
+    clarify_count = max(int(stored), int(scanned))
+    msgs = state.get("messages", []) or []
+    ai_types = [type(m).__name__ for m in msgs if not isinstance(m, HumanMessage)]
+    print(
+        f"[intent_router] messages={len(msgs)} stored_count={stored} "
+        f"scanned_count={scanned} → clarify_count={clarify_count} "
+        f"ai_message_types={ai_types}",
+        flush=True,
+    )
     cap_hit = (not offer_presented) and (clarify_count >= MAX_CLARIFY_TURNS)
     if cap_hit:
         stage = "READY_FOR_OFFER"
@@ -726,7 +744,20 @@ def clarify_node(state: GraphState) -> Dict[str, Any]:
         )
         content = _strip_reasoning(resp.content)
 
-    return {"messages": [AIMessage(content=content)]}
+    # Increment the clarify counter explicitly.  This is the authoritative
+    # signal the intent router reads — do not rely on scanning messages
+    # after checkpointer restore (message subclasses may deserialize as
+    # dicts, silently zeroing an ``isinstance``-based counter).
+    prev = state.get("clarify_count") or 0
+    new_count = int(prev) + 1
+    print(
+        f"[clarify_node] asking Q#{new_count} (prev clarify_count={prev})",
+        flush=True,
+    )
+    return {
+        "messages": [AIMessage(content=content)],
+        "clarify_count": new_count,
+    }
 
 
 @traceable(run_type="retriever", name="offer_selection_node")
