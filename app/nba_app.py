@@ -10,16 +10,17 @@
 """Next-Best-Action multi-turn chatbot demo.
 
 A LangGraph pipeline that guides a bank customer through a short conversation,
-polls an XGBoost customer-risk guardrail on Cloudera AI Inference Service,
-consults a local SQLite rule engine of credit-card offers, and presents the
-best-fit offer in-chat.  Fully traced through LangSmith with a per-thread
-``thread_id`` so the entire conversation appears as one thread in the
-LangSmith Threads tab.
+applies a customer-risk guardrail, consults a local SQLite rule engine of
+credit-card offers, and presents the best-fit offer in-chat.  Fully traced
+through LangSmith with a per-thread ``thread_id`` so the entire conversation
+appears as one thread in the LangSmith Threads tab.
 
-The risk guardrail is a binary XGBoost classifier trained on
-``customers.risk_tier`` (see ``xgboost/01_train_xgboost_onnx.ipynb``); its
-feature vector is built from ``state["customer_record"]`` at guardrail time,
-not from LLM-extracted chat features.
+The risk guardrail is currently a **rules-based placeholder** that reads
+``state["customer_record"]`` and applies a few if/else checks (see
+``_rules_based_risk_score``).  An ML-backed guardrail (XGBoost or PyTorch,
+served via Cloudera AI Inference Service) is scaffolded under
+``xgboost/`` and ``pytorch_train/`` for future re-enablement — swap the
+call in ``risk_guardrail_node`` back to the model endpoint when ready.
 
 Runs as a Cloudera AI Application via ``launch_app.py``.
 """
@@ -29,11 +30,9 @@ from __future__ import annotations
 import json
 import os
 import random
-import time
 import uuid
 from typing import Annotated, Any, Dict, List, Literal, Optional, TypedDict
 
-import httpx
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
@@ -42,7 +41,6 @@ from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from langsmith import Client, traceable
 from langsmith.run_helpers import get_current_run_tree
-from open_inference.openapi.client import InferenceRequest, OpenInferenceClient
 from pydantic import BaseModel, Field
 
 from db import get_conn, init_schema, seed_offers
@@ -62,7 +60,10 @@ LLM_MODEL_ID = os.environ.get("LLM_MODEL_ID", "nemotron")
 LLM_ENDPOINT_BASE_URL = os.environ.get("LLM_ENDPOINT_BASE_URL", "")
 LLM_CDP_TOKEN = os.environ.get("LLM_CDP_TOKEN", "")
 
-# Classifier (XGBoost customer-risk model on Cloudera AI Inference Service)
+# Classifier (currently disabled — rules-based guardrail is used instead).
+# These env vars are read but unused; the ML-backed guardrail can be re-enabled
+# by pointing risk_guardrail_node back at the endpoint call in the git history
+# (see xgboost/ and pytorch_train/ for the trained artifacts).
 CLF_MODEL_ID = os.environ.get("CLF_MODEL_ID", "nba-risk-onnx-xgboost")
 CLF_ENDPOINT_BASE_URL = os.environ.get("CLF_ENDPOINT_BASE_URL", "")
 CLF_CDP_TOKEN = os.environ.get("CLF_CDP_TOKEN", "")
@@ -134,10 +135,11 @@ class Intent(BaseModel):
     reasoning: str = ""
 
 
-# XGBoost risk-guardrail feature order.  MUST match the training order used
-# in xgboost/01_train_xgboost_onnx.ipynb — the one-hot suffixes come from
-# pii_datagen._EMP_STATUSES.  Mirrored here (rather than imported) so the app
-# module can be traced without dragging in Faker.
+# ML-guardrail feature order.  Currently unused (the rules-based guardrail
+# reads customer_record fields directly), but kept as documentation of the
+# training contract in xgboost/01_train_xgboost_onnx.ipynb and
+# pytorch_train/01_train_pytorch_onnx.ipynb.  Restore the endpoint call in
+# risk_guardrail_node and this list becomes the payload's column order.
 _EMP_STATUSES = ["EMPLOYED", "SELF_EMPLOYED", "STUDENT", "UNEMPLOYED", "RETIRED"]
 FEATURE_ORDER = [
     "age",
@@ -388,61 +390,40 @@ def _load_customer(customer_id: Optional[int]) -> Dict[str, Any]:
 
 
 # ----------------------------------------------------------------------
-# XGBoost customer-risk call
+# Rules-based customer-risk guardrail (placeholder for the ML model)
 # ----------------------------------------------------------------------
 
 
-@traceable(run_type="tool", name="xgboost_infer")
-def _xgboost_infer(features: Dict[str, Any]) -> float:
-    """Poll the Cloudera AI Inference Service customer-risk endpoint.
+@traceable(run_type="tool", name="rules_based_risk_score")
+def _rules_based_risk_score(customer: Dict[str, Any]) -> float:
+    """Return a pseudo-probability of "high risk" from a couple of if/else rules.
 
-    Returns P(high_risk).  When NBA_MOCK=1 or no endpoint is configured,
-    short-circuits so the demo can run without a live model.
+    Placeholder until the XGBoost/PyTorch endpoint under ``xgboost/`` or
+    ``pytorch_train/`` is re-enabled.  Reads the same fields the ML guardrail
+    would consume (age, annual_income, existing_debt, employment_status),
+    plus ``risk_tier`` (already computed in ``pii_datagen``).
+
+    Rules (any match → 0.9, else scaled by debt-to-income):
+    - risk_tier == "HIGH"
+    - debt-to-income ratio > 0.6
+    - UNEMPLOYED with existing_debt > 5_000
     """
-    if NBA_MOCK or not CLF_ENDPOINT_BASE_URL:
-        # Mock heuristic: debt-to-income above 0.4 scores as "high risk" so the
-        # decline path is exercisable end-to-end without a live endpoint.
-        income = float(features.get("annual_income", 0) or 0)
-        debt = float(features.get("existing_debt", 0) or 0)
-        if income > 0 and debt / income > 0.4:
-            return 0.85
-        return 0.05
+    risk_tier = str(customer.get("risk_tier", "") or "").upper()
+    income = float(customer.get("annual_income", 0) or 0)
+    debt = float(customer.get("existing_debt", 0) or 0)
+    employment = str(customer.get("employment_status", "") or "").upper()
+    dti = (debt / income) if income > 0 else 0.0
 
-    headers = {
-        "Authorization": f"Bearer {CLF_CDP_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    httpx_client = httpx.Client(headers=headers)
-    client = OpenInferenceClient(base_url=CLF_ENDPOINT_BASE_URL, httpx_client=httpx_client)
+    if risk_tier == "HIGH":
+        return 0.9
+    if dti > 0.6:
+        return 0.9
+    if employment == "UNEMPLOYED" and debt > 5_000:
+        return 0.9
 
-    client.check_server_readiness()
-    _ = client.read_model_metadata(CLF_MODEL_ID)
-
-    ordered_values = [float(features.get(f, 0) or 0) for f in FEATURE_ORDER]
-    payload = {
-        "parameters": {"content_type": "pd"},
-        "inputs": [
-            {
-                "name": "input",
-                "datatype": "FP32",
-                "shape": [1, len(FEATURE_ORDER)],
-                "data": [ordered_values],
-            }
-        ],
-    }
-
-    start = time.time()
-    pred = client.model_infer(
-        CLF_MODEL_ID,
-        request=InferenceRequest(inputs=payload["inputs"]),
-    )
-    latency = time.time() - start
-    resp_json = json.loads(pred.json())
-    # P(high_risk) = second element of the probabilities output.  Output shape
-    # [-1, 2] is preserved by the binary target used at train time.
-    high_risk_proba = float(resp_json["outputs"][1]["data"][1])
-    print(f"[xgboost_infer] high_risk_proba={high_risk_proba:.4f} latency={latency:.2f}s")
-    return high_risk_proba
+    # Below the blocking threshold: return a small DTI-scaled score so the
+    # UI's "high-risk probability" panel still shows something meaningful.
+    return min(0.3, dti / 2.0)
 
 
 # ----------------------------------------------------------------------
@@ -501,12 +482,16 @@ def intake_node(state: GraphState) -> Dict[str, Any]:
 
 @traceable(run_type="chain", name="risk_guardrail_node")
 def risk_guardrail_node(state: GraphState) -> Dict[str, Any]:
-    """Poll the XGBoost customer-risk endpoint once per thread (cached).
+    """Score the customer once per thread using the rules-based guardrail.
 
-    The feature vector is built from ``state["customer_record"]`` (loaded by
-    ``_load_customer``) rather than from LLM-extracted chat features, so we
-    always send a well-formed 8-element vector.  If the customer_id is
-    unknown and no row was loaded, skip the call and pass through.
+    Reads ``state["customer_record"]`` (loaded by ``_load_customer``) and
+    passes the profile fields to ``_rules_based_risk_score``.  If the
+    customer_id is unknown and no row was loaded, skip scoring and pass
+    through as low-risk.
+
+    The ML-backed guardrail (XGBoost/PyTorch endpoint) is temporarily
+    disabled; re-enable by swapping ``_rules_based_risk_score`` back for the
+    endpoint call.
     """
     if state.get("high_risk_probability") is not None:
         return {}
@@ -517,19 +502,7 @@ def risk_guardrail_node(state: GraphState) -> Dict[str, Any]:
         # graph continues to the intent router.
         return {"high_risk_probability": 0.0, "risk_blocked": False}
 
-    # Build the feature vector to match training.  employment_status is
-    # one-hot-encoded; an unknown status lands at an all-zero one-hot block,
-    # which the model handles fine.
-    features: Dict[str, Any] = {
-        "age": float(customer.get("age", 0) or 0),
-        "annual_income": float(customer.get("annual_income", 0) or 0),
-        "existing_debt": float(customer.get("existing_debt", 0) or 0),
-    }
-    emp = str(customer.get("employment_status", "") or "").upper()
-    for status in _EMP_STATUSES:
-        features[f"emp_{status}"] = 1.0 if emp == status else 0.0
-
-    proba = _xgboost_infer(features)
+    proba = _rules_based_risk_score(customer)
     return {
         "high_risk_probability": proba,
         "risk_blocked": proba >= HIGH_RISK_THRESHOLD,
