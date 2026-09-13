@@ -847,11 +847,46 @@ def run_turn(
 # ----------------------------------------------------------------------
 
 
+def _demo_customer_picks(per_tier: int = 2) -> List[Dict[str, Any]]:
+    """Return a small deterministic slate of customers spanning every risk tier.
+
+    Streamlit's sidebar uses this to build a dropdown so demo users can hit
+    the offer path (LOW/MED tiers) or the risk-decline path (HIGH tier) on
+    purpose, rather than rolling dice against a random ``customer_id``.
+    """
+    conn = get_conn()
+    try:
+        init_schema(conn)
+        rows = conn.execute(
+            """
+            SELECT customer_id, full_name, risk_tier, annual_income,
+                   employment_status, existing_debt
+            FROM customers
+            WHERE risk_tier IN ('LOW','MED','HIGH')
+            ORDER BY risk_tier, customer_id
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    picks: Dict[str, List[Dict[str, Any]]] = {"LOW": [], "MED": [], "HIGH": []}
+    for r in rows:
+        tier = r["risk_tier"]
+        if tier in picks and len(picks[tier]) < per_tier:
+            picks[tier].append({k: r[k] for k in r.keys()})
+    # Order: LOW → MED → HIGH so the dropdown flows from safest to riskiest.
+    return [r for tier in ("LOW", "MED", "HIGH") for r in picks[tier]]
+
+
 def run_streamlit_app() -> None:
     import streamlit as st
 
     st.set_page_config(page_title="NBA Credit-Card Chatbot", layout="wide")
     st.title("Next-Best-Action Credit-Card Chatbot")
+
+    # Cache the customer slate so we hit the DB once per Streamlit session
+    # rather than on every rerun.
+    demo_customers = st.cache_data(_demo_customer_picks)()
 
     # --- Session state ------------------------------------------------
     if "thread_id" not in st.session_state:
@@ -873,16 +908,35 @@ def run_streamlit_app() -> None:
             key="_thread_id_display",
             disabled=True,
         )
-        cid_str = st.text_input(
-            "customer_id (blank = random)",
-            value="" if st.session_state.customer_id is None else str(st.session_state.customer_id),
-        )
-        if cid_str.strip():
-            try:
-                st.session_state.customer_id = int(cid_str)
-            except ValueError:
-                st.warning("customer_id must be an integer")
+        # Curated dropdown covering every risk tier so the demo can
+        # deterministically exercise both the offer path (LOW/MED) and the
+        # risk-decline path (HIGH).  See ``_demo_customer_picks`` for how
+        # the slate is built.
+        if demo_customers:
+            def _fmt_customer(cid: int) -> str:
+                row = next(r for r in demo_customers if r["customer_id"] == cid)
+                return (
+                    f"#{row['customer_id']} — {row['full_name']} "
+                    f"({row['risk_tier']} risk, ${row['annual_income']:,})"
+                )
+
+            cid_options = [r["customer_id"] for r in demo_customers]
+            default_idx = 0
+            if st.session_state.customer_id in cid_options:
+                default_idx = cid_options.index(st.session_state.customer_id)
+            selected_cid = st.selectbox(
+                "customer_id",
+                cid_options,
+                index=default_idx,
+                format_func=_fmt_customer,
+                help=(
+                    "LOW/MED risk → clarify then present an offer. "
+                    "HIGH risk → the guardrail declines and redirects to support."
+                ),
+            )
+            st.session_state.customer_id = selected_cid
         else:
+            st.info("Seed the DB (`python app/pii_datagen.py --ensure`) to populate the dropdown.")
             st.session_state.customer_id = None
 
         if st.button("New conversation"):

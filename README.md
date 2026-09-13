@@ -72,12 +72,22 @@ With `LANGSMITH_API_KEY`, `LANGSMITH_PROJECT`, and the LLM/XGBoost endpoint env 
 
 ### Step 5 — Deploy the chatbot and try it live
 
-Launch the Streamlit app as a Cloudera AI Application pointing at **`launch_app.py`** (which boots `app/nba_app.py`). Open the app URL and try:
+Launch the Streamlit app as a Cloudera AI Application pointing at **`launch_app.py`** (which boots `app/nba_app.py`).
 
-- **Card upgrade** → *"Hi, I'd like to upgrade my credit card."* → follow the clarifying prompts (income, goal). The bot will pitch the best-fit offer from the rule engine.
+**Pick a customer from the sidebar dropdown** before you start typing. The dropdown is populated at app start from the seeded SQLite `customers` table and covers all three risk tiers (two customers each) — LOW → MED → HIGH. Every entry shows the customer name, risk tier, and annual income so you can see up-front which path the graph will take.
+
+Two paths to try:
+
+| Pick a customer in tier… | What the graph does |
+|---|---|
+| **LOW** or **MED** | `intake → risk_guardrail → intent_router → clarify → select_offer → offer_presentation`. The bot pitches the best-fit offer from the rule engine (Platinum Travel, Cashback Everyday, Student Starter, …). |
+| **HIGH** | `intake → risk_guardrail → decline`. `_rules_based_risk_score` clears `HIGH_RISK_THRESHOLD` (0.5 by default) and the bot politely declines and redirects to support. |
+
+Scripted turns to send once you've picked a customer:
+
+- **Card upgrade** → *"Hi, I'd like to upgrade my credit card."* → follow the clarifying prompts (income, goal). The bot pitches the best-fit offer.
 - **Post-offer follow-up** → *"What's the annual fee?"* — routes to `post_offer_chat` using the offer already in state.
-- **New conversation** → click **"New conversation"** in the sidebar to start a fresh `thread_id`.
-- **Risk decline path** → pick a `customer_id` from the sidebar that maps to a `HIGH` risk tier row in the DB. The `risk_guardrail_node` should short-circuit into a polite decline.
+- **New conversation** → click **"New conversation"** in the sidebar to start a fresh `thread_id` (the customer stays selected).
 
 Every turn is a `run_turn(...)` invocation tagged with `thread_id` metadata, so each conversation shows up as a single thread in LangSmith.
 
