@@ -128,6 +128,69 @@ All nodes are `@traceable`. The whole per-turn invocation is wrapped by `run_tur
 
 ---
 
+## MAS Workflow
+
+The multi-agent system is a LangGraph `StateGraph` compiled with a `MemorySaver` checkpointer. Each user turn re-enters the graph at `intake` and follows one of four paths to `END`: **decline** (guardrail fired), **clarify** (need more info), **offer_presentation** (via `select_offer`), or **post_offer_chat** (offer already on the table, customer is asking follow-ups). Solid arrows are unconditional transitions; dashed arrows are conditional routes emitted by the two routers (`risk_router` after the guardrail, `stage_router` after the intent router).
+
+```mermaid
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+	__start__([<p>__start__</p>]):::first
+	intake(intake)
+	risk_guardrail(risk_guardrail)
+	intent_router(intent_router)
+	clarify(clarify)
+	select_offer(select_offer)
+	offer_presentation(offer_presentation)
+	post_offer_chat(post_offer_chat)
+	decline(decline)
+	__end__([<p>__end__</p>]):::last
+	__start__ --> intake;
+	intake --> risk_guardrail;
+	intent_router -.-> clarify;
+	intent_router -.-> post_offer_chat;
+	intent_router -.-> select_offer;
+	risk_guardrail -.-> decline;
+	risk_guardrail -. &nbsp;continue&nbsp; .-> intent_router;
+	select_offer --> offer_presentation;
+	clarify --> __end__;
+	decline --> __end__;
+	offer_presentation --> __end__;
+	post_offer_chat --> __end__;
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc
+```
+
+### What each node does
+
+| Node | Role | Reads from state | Writes to state |
+|---|---|---|---|
+| `intake` | Merges the newest user turn into the accumulated feature set via a Nemotron structured-output prompt (`method="json_mode"`), and lazily loads the customer PII row from SQLite on first turn. | `messages`, `customer_id`, `accumulated_features` | `accumulated_features`, `customer_record` |
+| `risk_guardrail` | Runs `_rules_based_risk_score(customer_record)` — the current placeholder scorer covering `risk_tier == HIGH`, DTI > 0.6, and unemployed-with-debt. Sets `risk_blocked` when the score crosses `HIGH_RISK_THRESHOLD`. Swap in an ML endpoint call here to re-enable the classifier path. | `customer_record` | `high_risk_probability`, `risk_blocked` |
+| `intent_router` | Nemotron classifier that decides the next hop: `NEED_MORE_INFO` → clarify, `READY_FOR_OFFER` → select_offer, `POST_OFFER_CHAT` → post_offer_chat. Reads the full transcript, accumulated features, and whether an `[OFFER PRESENTED: …]` marker is already in the messages. | `messages`, `accumulated_features`, `selected_offer` | `conversation_stage`, `_next_stage` |
+| `clarify` | Nemotron prompt that asks one short, specific clarifying question, without re-asking a field already populated. | `messages`, `accumulated_features` | `messages` (appends `AIMessage`) |
+| `select_offer` | SQL + Python rule engine (`app/offer_rules.py`) over the 5-offer catalog. Filters by customer eligibility (risk tier, age, income) then re-scores by stated goal + feature match. Returns top-3 candidates; the highest becomes `selected_offer`. | `customer_record`, `accumulated_features` | `selected_offer`, `candidate_offers` |
+| `offer_presentation` | Nemotron pitches the chosen offer conversationally (under 120 words, prefixed with `[OFFER PRESENTED: <offer_id>]` so downstream turns detect an offer has been made). | `selected_offer`, `customer_record`, `accumulated_features`, `messages` | `messages`, `conversation_stage = "offer_presented"` |
+| `post_offer_chat` | Nemotron answers follow-up questions grounded on the offer JSON already in state. Refuses to invent facts it doesn't have. | `selected_offer`, `messages` | `messages`, `conversation_stage = "post_offer"` |
+| `decline` | Nemotron writes a short, warm decline that redirects the customer to support without quoting any specific figures. Terminal node. | `messages` | `messages`, `risk_blocked = True` |
+
+### Regenerating the diagram
+
+The Mermaid source is exported straight from the compiled `StateGraph` — no risk of drift:
+
+```
+NBA_MOCK=1 python scripts/export_graph_mermaid.py
+```
+
+That writes `img/nba_graph.mmd` and prints the same Mermaid text you see in the fenced block above. When you add or rewire a node in `app/nba_app.py:_build_graph`, re-run the script and paste the updated block back in here.
+
+---
+
 ## Environment variables
 
 Copy `.env.example` to `.env` and fill in:
