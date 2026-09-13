@@ -10,6 +10,7 @@
 - [Key Features](#key-features)
 - [Quickstart / Guide](#quickstart--guide)
 - [Architecture / Software Components](#architecture--software-components)
+- [LangSmith Observability & Evaluation](#langsmith-observability--evaluation)
 - [Target Audience](#target-audience)
 - [Repository Structure](#repository-structure)
 - [Prerequisites](#prerequisites)
@@ -20,13 +21,31 @@
 
 This blueprint shows how to build, evaluate, and observe a **production-grade multi-agent chatbot** entirely on Cloudera AI. The demo user plays a bank customer: they open a chat, state their reason for contacting, and a **LangGraph** multi-agent system asks clarifying questions until it has enough context to present the best-fit credit-card offer. A customer-risk guardrail short-circuits the workflow into a polite decline for HIGH-risk profiles. Every turn is traced to **LangSmith** with per-thread grouping and thumbs feedback, and three notebooks turn scripted conversations into repeatable **offline evaluations** with deterministic and LLM-as-judge scorers. The stack — Nemotron on **Cloudera AI Inference Service**, LangGraph checkpointer state, Streamlit UI hosted as a **Cloudera AI Application**, and an optional XGBoost/PyTorch ONNX risk classifier — is the reference wiring for any evaluated agentic app on the Cloudera platform.
 
+**The demo is two things at once.** The chat surface is what a customer sees; the LangSmith surface — traced runs, threaded conversations, per-turn feedback, and offline experiments on a golden dataset — is what a bank's product, risk, and engineering teams see. Both are covered in the [Demo](#demo) section below, and the [LangSmith Observability & Evaluation](#langsmith-observability--evaluation) section walks through how the wiring works end-to-end.
+
 > **Guardrail status.** The customer-risk guardrail currently runs as a small **rules-based placeholder** in `app/nba_app.py` (`_rules_based_risk_score`) — no model endpoint required. An ML-backed guardrail (XGBoost / PyTorch → ONNX → CAI Inference Service) is scaffolded under `xgboost/` and `pytorch_train/` and can be re-enabled by swapping the call in `risk_guardrail_node`. Steps 2–3 of the Quickstart describe the ML path and are optional while the rules-based guardrail is in use.
 
 ## Demo
 
-A representative interaction with the deployed chatbot on Cloudera AI. The customer (Allison Hill, LOW-risk tier, $106K income) asks to upgrade their card. The bot asks two clarifying questions — reason for change, then income — hits the `Clarify turns: 2 / 3` cap, and pitches **Cashback Everyday** (2% cash back, 18.99–25.99% APR). The debug pane on the right shows the graph stage (`offer_presented`), the guardrail's high-risk probability (4.19%), and the selected offer id (`CASHBACK_EVERYDAY`). Thumbs feedback under the reply lands on the correct per-turn `run_id` in LangSmith.
+The "demo" is deliberately two things at once — a **customer-facing multi-agent chatbot** on Cloudera AI, *and* the **enterprise observability + evaluation layer** that lets a bank actually run it: every turn is a traced LangSmith run, grouped by thread, with token / latency accounting and per-turn thumbs feedback, plus a golden-dataset offline experiment suite that grades correctness, guardrail behavior, offer relevance, and conversation quality on scripted conversations before any prompt change ships.
+
+### 1. Customer interaction — the chatbot on Cloudera AI
+
+The customer (Allison Hill, LOW-risk tier, $106K income) asks to upgrade their card. The LangGraph MAS asks two clarifying questions — reason for change, then income — hits the `Clarify turns: 2 / 3` cap, and pitches **Cashback Everyday** (2% cash back, 18.99–25.99% APR). The debug pane on the right shows the graph stage (`offer_presented`), the guardrail's high-risk probability (4.19%), and the selected offer id (`CASHBACK_EVERYDAY`). Thumbs feedback under the reply lands on the correct per-turn `run_id` in LangSmith.
 
 ![NBA chatbot end-to-end interaction on Cloudera AI](img/nba-chat-demo.png)
+
+### 2. Enterprise observability — the LangSmith trace view
+
+Every user message is one `run_turn(...)` root run in the `nba-demo` LangSmith project. The **Tracing** view lists them with latency, token count, and input/output previews, and same-thread turns cluster by their shared `thread_id` so a whole conversation reads as one contiguous block. This is the surface a product / risk / ops team actually watches: what people are saying, what the bot said back, how long each turn took, and how many tokens it burned.
+
+![LangSmith tracing project view — per-turn runs with latency, tokens, and thread grouping](img/langsmith-runs.png)
+
+### 3. Per-turn drill-down — the graph waterfall
+
+Clicking a single turn opens the full LangGraph waterfall: `intake → risk_guardrail → intent_router → …`, each with its own sub-runs (`ChatPromptTemplate`, `ChatOpenAI` on `nvidia/nemotron-3-super-…`, `PydanticOutputParser`). The right pane shows the exact input the customer typed, the accumulated messages, and — via the Feedback tab — the 👍/👎 the user gave. This is the surface an engineer uses to debug a bad recommendation or a hung clarify loop.
+
+![LangSmith run detail — LangGraph waterfall with per-node runs and IO panel](img/langsmith-run-detail.png)
 
 ## Use Case
 
@@ -236,6 +255,61 @@ NBA_MOCK=1 python scripts/export_graph_mermaid.py
 
 That writes `img/nba_graph.mmd` and prints the same Mermaid text you see in the fenced block above. When you add or rewire a node in `app/nba_app.py:_build_graph`, re-run the script and paste the updated block back in here.
 
+## LangSmith Observability & Evaluation
+
+LangSmith is the observability plane of this blueprint. It answers two very different questions that a bank running an agentic chatbot has to answer at the same time:
+
+- **Offline — "is a proposed change safe to ship?"** — grade a fixed golden set of scripted conversations against deterministic and LLM-as-judge scorers; run experiments side-by-side; compare a new prompt or temperature against a baseline before any user sees it.
+- **Online — "what is production actually doing right now?"** — every live turn from the Streamlit app is a traced root run, grouped by conversation, with per-turn thumbs feedback and (optionally) auto-evaluators sampling live traffic.
+
+Both paths reuse the same graph (`app/nba_app.py:run_turn`) and the same evaluators (`nba_evaluators.ipynb`), so a scorer you trust offline is the same scorer you can attach to live traffic.
+
+### How traceability works — the wiring
+
+- **Root run per turn.** `run_turn(...)` in `app/nba_app.py` is decorated with `@traceable`. Every user message becomes one root run named `nba_turn` in the `LANGSMITH_PROJECT` project. All LangGraph nodes it invokes (`intake`, `risk_guardrail`, `intent_router`, `clarify`, `select_offer`, `offer_presentation`, `post_offer_chat`, `decline`) show up as nested runs under it, with their own inputs, outputs, latency, and token counts.
+- **Thread grouping.** Each root run is tagged with `thread_id` metadata (the same key that drives LangGraph's `MemorySaver` checkpointer). LangSmith's **Threads** tab uses that tag to fold every turn of a conversation into a single, scrollable thread — mirroring what the customer actually experienced.
+- **Per-turn feedback.** The 👍/👎 buttons under each assistant reply in the Streamlit app call `Client().create_feedback(run_id, key="user_thumbs", score=1|0)`, where `run_id` is the current turn's root — so feedback attaches to the specific turn, not the whole conversation, which is what makes the signal useful for downstream evaluators.
+- **Sidebar link.** The Streamlit sidebar renders a direct link to the current thread in LangSmith, so a support / QA operator can jump from a customer complaint to the full trace in one click.
+
+### Offline evaluation
+
+Three notebooks, run in order, produce a repeatable experiment on a golden dataset:
+
+1. **`nba_dataset_upload.ipynb`** — creates the `NBA Golden Dataset` in LangSmith: ~14 scripted multi-turn conversations, each labeled with a `split` (`travel`, `balance-transfer`, `secured`, `student`, `cashback`, `risk-decline`). Each example carries the customer id, the full turn-by-turn script, and the reference outputs (`expected_offer_id`, `expected_path`, acceptable turn counts).
+2. **`nba_evaluators.ipynb`** — defines four evaluators, mixing deterministic scorers with LLM-as-judge:
+   - `correct_offer_selection` — deterministic, matches the final `selected_offer.offer_id` against `expected_offer_id`.
+   - `guardrail_correctness` — deterministic, checks whether the risk guardrail fired iff `expected_path == 'decline'`.
+   - `offer_relevance_llm_judge` — Nemotron judge with a pydantic `Relevance(score, reasoning)` schema, grading offer fit against what the customer said they wanted.
+   - `conversation_quality_llm_judge` — Nemotron judge over the whole transcript, grading clarifying-question quality, non-repetition, and whether the bot recommended within `[min_turns_to_offer, max_turns_to_offer]`.
+3. **`nba_experiments.ipynb`** — the target function **replays each scripted conversation turn-by-turn** against the compiled graph (fresh `thread_id` per example, one `run_turn` per user turn) and returns the final state. `client.evaluate(...)` grades it with the four evaluators. Several experiments run side-by-side so you can diff a change against a baseline:
+   - `nba-baseline-t0.2` — reference metrics at temperature 0.2.
+   - `nba-hi-temp-0.7` — temperature 0.7 with `num_repetitions=3` for stability.
+   - `nba-risk-split` — decline path only.
+   - `nba-student-split` — student split only.
+
+Acceptance targets at temperature 0.2: `correct_offer >= 0.7`, `guardrail_correct == 1.0`, `offer_relevance >= 7/10`.
+
+Because the target function calls the real `run_turn`, every offline example also produces a full nested trace in LangSmith — meaning a failing evaluator score is exactly one click away from the graph waterfall that produced it.
+
+### Online monitoring
+
+Once the Streamlit app is deployed as a Cloudera AI Application, the same tracing is on by default:
+
+- **Traces.** Every `run_turn` is a root run in `LANGSMITH_PROJECT`. Screenshots 2 and 3 in the Demo section above show the list view and the per-turn waterfall.
+- **Threads.** LangSmith's Threads tab groups every turn sharing the same `thread_id` metadata into one conversation view. The Streamlit sidebar renders a direct link.
+- **Feedback.** 👍/👎 buttons below every assistant reply land on the correct per-turn `run_id`. Feedback rate is directly queryable and dashboardable in LangSmith.
+- **Optional online evaluators.** In LangSmith UI → project settings → *Auto-evaluators*, attach `offer_relevance_llm_judge` (or a toxicity check) to run on a sample of production traces. UI-configured, no code changes required.
+
+**Alert patterns to configure in LangSmith:** drop in `offer_relevance` mean, spike in `guardrail_correct == 0` false positives, or a spike in 👎 feedback.
+
+### Why this matters for the enterprise
+
+The chatbot on its own is a demo. The reason this blueprint is a *blueprint* is that the LangSmith layer gives a bank the three things it actually needs to run one in production:
+
+1. **A grading harness** to prove a prompt / model change is at least as good as what's already live, before shipping it (offline experiments).
+2. **A per-turn audit trail** so risk / compliance / customer-support teams can inspect any specific interaction after the fact (threaded traces + feedback).
+3. **A closed loop** from live thumbs feedback and auto-evaluator scores back into the golden dataset — the same evaluators and the same target function run on both sides.
+
 ## Target Audience
 
 - **Solution architects & SEs** — reference wiring for an evaluated, observed agentic app on Cloudera AI they can adapt to a customer's own dataset.
@@ -324,32 +398,7 @@ The Nemotron LLM endpoint's sizing is orthogonal and depends entirely on your CA
 
 ## Documentation
 
-### Offline evaluation — details
-
-Three notebooks, run in order:
-
-1. **`nba_dataset_upload.ipynb`** — creates dataset `NBA Golden Dataset` in LangSmith with ~14 scripted multi-turn conversations, each labeled with a `split` (`travel`, `balance-transfer`, `secured`, `student`, `cashback`, `risk-decline`).
-2. **`nba_evaluators.ipynb`** — defines 4 evaluators:
-   - `correct_offer_selection` (deterministic — matches `expected_offer_id`)
-   - `guardrail_correctness` (deterministic — did the risk guardrail fire iff expected)
-   - `offer_relevance_llm_judge` (Nemotron judge, pydantic `Relevance(score, reasoning)`)
-   - `conversation_quality_llm_judge` (Nemotron judge on transcript + `turn_count_to_offer`)
-3. **`nba_experiments.ipynb`** — the target function **replays each scripted conversation turn-by-turn** against the compiled graph (fresh `thread_id` per example, one `run_turn` per user turn), then LangSmith's `evaluate()` grades the final state. Runs several experiments side-by-side:
-   - `nba-baseline-t0.2` — reference metrics at temperature 0.2
-   - `nba-hi-temp-0.7` — temperature 0.7 with `num_repetitions=3` for stability
-   - `nba-risk-split` — decline path only
-   - `nba-student-split` — student split only
-
-### Online monitoring — details
-
-Inside the running Streamlit app:
-
-- **Traces.** Every `run_turn` is a root run in the `LANGSMITH_PROJECT` project. Nodes are nested runs — you can drill into `intake`, `risk_guardrail`, `xgboost_infer`, `intent_router`, and so on for each turn.
-- **Threads.** LangSmith's Threads tab groups every turn sharing the same `thread_id` metadata into one conversation view. The sidebar in the app renders a direct link to the current thread.
-- **Feedback.** 👍/👎 buttons below every assistant reply call `Client().create_feedback(run_id, key="user_thumbs", score=1|0)`. Because `run_id` is the per-turn root, feedback attaches to the specific turn, not the whole thread.
-- **Optional online evaluators.** In LangSmith UI → project settings → *Auto-evaluators*, attach `offer_relevance_llm_judge` (or a toxicity check) to run on a sample of production traces. UI-configured, no code changes required.
-
-Alert patterns to configure in LangSmith: drop in `offer_relevance` mean, spike in `guardrail_correct == 0` false positives, or a spike in 👎 feedback.
+The end-to-end LangSmith observability + evaluation story lives in its own [LangSmith Observability & Evaluation](#langsmith-observability--evaluation) section above. What follows is repo-local reference material.
 
 ### Extending
 
