@@ -76,6 +76,11 @@ HIGH_RISK_THRESHOLD = float(
 )
 NBA_MOCK = os.environ.get("NBA_MOCK", "") == "1"
 
+# Hard cap on clarifying questions before the graph is forced to present an
+# offer.  Prevents the intent router from looping on NEED_MORE_INFO when the
+# feature schema can't capture every detail the customer volunteers.
+MAX_CLARIFY_TURNS = int(os.environ.get("NBA_MAX_CLARIFY_TURNS", "3"))
+
 # LangSmith URLs (for UI links from the sidebar)
 LANGSMITH_ORG = os.environ.get("LANGSMITH_ORG", "")
 LANGSMITH_PROJECT = os.environ.get("LANGSMITH_PROJECT", "nba-demo")
@@ -210,6 +215,12 @@ Be conservative: prefer NEED_MORE_INFO if the goal is vague.  Prefer
 POST_OFFER_CHAT whenever an offer has already been presented, even for
 questions that could arguably reset the flow.
 
+IMPORTANT: If the assistant has already asked 3 or more clarifying
+questions in the transcript, choose READY_FOR_OFFER — even if some
+fields are still missing.  The rule engine can pick a best-guess offer
+from partial info; a fourth clarifying question is worse than a
+best-guess pitch.
+
 Return ONLY the JSON object, nothing else.
 """,
         ),
@@ -232,7 +243,13 @@ the best credit-card offer.  Ask ONE short, specific clarifying question to
 close the biggest gap in what you know so far.
 
 Guidelines:
-- Never re-ask for a field that is already populated in the features JSON.
+- NEVER re-ask a question already in "Questions already asked" below, even
+  if you paraphrase it.  Pick a different topic.
+- NEVER re-ask for a field that is already populated in the features JSON.
+- Prefer questions that would materially change which card to recommend
+  (primary use / goal, approximate income, credit-building need).  Do NOT
+  drill into granular details (specific merchants, exact monthly spend,
+  merchant categories) — you have enough to recommend after 2-3 questions.
 - Keep it under 40 words.
 - Sound conversational, not like a form.
 - If the customer mentioned a goal (e.g. travel, rebuilding credit,
@@ -243,6 +260,7 @@ Guidelines:
             "human",
             "Conversation so far:\n{transcript}\n\n"
             "Accumulated features (JSON):\n{features}\n\n"
+            "Questions already asked (do NOT repeat any of these):\n{prior_questions}\n\n"
             "Ask your next clarifying question.",
         ),
     ]
@@ -365,6 +383,38 @@ def _transcript(messages: List[BaseMessage]) -> str:
         role = "CUSTOMER" if isinstance(m, HumanMessage) else "ASSISTANT"
         lines.append(f"{role}: {m.content}")
     return "\n".join(lines) if lines else "(no messages yet)"
+
+
+def _count_clarify_turns(messages: List[BaseMessage]) -> int:
+    """Number of assistant clarifying questions already asked (pre-offer).
+
+    Stops counting the moment we hit an ``[OFFER PRESENTED: ...]`` marker so
+    that post-offer assistant chat never inflates the clarify budget.
+    """
+    n = 0
+    for m in messages or []:
+        if isinstance(m, AIMessage):
+            content = m.content if isinstance(m.content, str) else ""
+            if content.startswith("[OFFER PRESENTED:"):
+                return n
+            n += 1
+    return n
+
+
+def _prior_clarify_questions(messages: List[BaseMessage]) -> List[str]:
+    """Verbatim list of prior assistant clarifying questions.
+
+    Fed to the clarify prompt so the LLM can be told, in-band, exactly which
+    questions are off-limits on this turn.
+    """
+    out: List[str] = []
+    for m in messages or []:
+        if isinstance(m, AIMessage):
+            content = m.content if isinstance(m.content, str) else ""
+            if content.startswith("[OFFER PRESENTED:"):
+                break
+            out.append(content)
+    return out
 
 
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
@@ -601,6 +651,19 @@ def intent_router_node(state: GraphState) -> Dict[str, Any]:
         )
         stage = decision.stage
 
+    # Hard cap: if we've already asked MAX_CLARIFY_TURNS clarifying questions
+    # and no offer has been presented yet, force the graph to commit to an
+    # offer.  The rule engine can always pick *something* from the offers
+    # table given the customer_record + partial features, so we'd rather
+    # present a best-guess offer than loop forever.
+    clarify_count = _count_clarify_turns(state.get("messages", []))
+    if (
+        not offer_presented
+        and stage == "NEED_MORE_INFO"
+        and clarify_count >= MAX_CLARIFY_TURNS
+    ):
+        stage = "READY_FOR_OFFER"
+
     stage_map = {
         "NEED_MORE_INFO": "gathering",
         "READY_FOR_OFFER": "offer_presented",  # will be set for real by presentation node
@@ -630,9 +693,17 @@ def clarify_node(state: GraphState) -> Dict[str, Any]:
             "or something else — and roughly what your annual income is?"
         )
     else:
+        prior_qs = _prior_clarify_questions(state.get("messages", []))
+        prior_qs_str = (
+            "\n".join(f"- {q}" for q in prior_qs) if prior_qs else "(none)"
+        )
         chain = clarify_prompt | get_llm()
         resp = chain.invoke(
-            {"transcript": transcript, "features": json.dumps(features, default=str)}
+            {
+                "transcript": transcript,
+                "features": json.dumps(features, default=str),
+                "prior_questions": prior_qs_str,
+            }
         )
         content = _strip_reasoning(resp.content)
 
