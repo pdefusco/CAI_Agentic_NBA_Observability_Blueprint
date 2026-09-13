@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import uuid
 from typing import Annotated, Any, Dict, List, Literal, Optional, TypedDict
 
@@ -354,6 +355,33 @@ def _transcript(messages: List[BaseMessage]) -> str:
     return "\n".join(lines) if lines else "(no messages yet)"
 
 
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_reasoning(text: str) -> str:
+    """Strip Nemotron-style chain-of-thought from an LLM response.
+
+    Nemotron 3 Super wraps its reasoning in ``<think>...</think>`` tags
+    before emitting the final answer.  Depending on the token stream, we can
+    end up with the full paired tags, only the closing ``</think>`` (opening
+    tag consumed by the tokenizer), or neither.  Drop the reasoning in all
+    three cases before showing the message to the customer / storing it in
+    state.messages / feeding it to the conversation-quality judge — the raw
+    LLM output is still visible on the individual LLM span in LangSmith for
+    debugging.
+    """
+    if not text:
+        return text
+    # Full paired tags anywhere in the string.
+    cleaned = _THINK_BLOCK_RE.sub("", text)
+    # Orphan closing tag: keep everything after the LAST ``</think>``.
+    lower = cleaned.lower()
+    idx = lower.rfind("</think>")
+    if idx != -1:
+        cleaned = cleaned[idx + len("</think>"):]
+    return cleaned.strip()
+
+
 def _merge_features(current: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
     """Merge freshly extracted features into the accumulator.
 
@@ -594,7 +622,7 @@ def clarify_node(state: GraphState) -> Dict[str, Any]:
         resp = chain.invoke(
             {"transcript": transcript, "features": json.dumps(features, default=str)}
         )
-        content = resp.content
+        content = _strip_reasoning(resp.content)
 
     return {"messages": [AIMessage(content=content)]}
 
@@ -657,7 +685,7 @@ def offer_presentation_node(state: GraphState) -> Dict[str, Any]:
                 "cta_text": offer["cta_text"],
             }
         )
-        content = resp.content
+        content = _strip_reasoning(resp.content)
 
     return {
         "messages": [AIMessage(content=content)],
@@ -684,7 +712,7 @@ def post_offer_chat_node(state: GraphState) -> Dict[str, Any]:
                 "transcript": transcript,
             }
         )
-        content = resp.content
+        content = _strip_reasoning(resp.content)
 
     return {"messages": [AIMessage(content=content)], "conversation_stage": "post_offer"}
 
@@ -701,7 +729,7 @@ def decline_node(state: GraphState) -> Dict[str, Any]:
         )
     else:
         chain = decline_prompt | get_llm()
-        content = chain.invoke({"transcript": transcript}).content
+        content = _strip_reasoning(chain.invoke({"transcript": transcript}).content)
 
     return {"messages": [AIMessage(content=content)], "risk_blocked": True}
 
