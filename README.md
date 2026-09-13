@@ -54,6 +54,8 @@ Open **`xgboost/02_deploy_xgboost_ai_inf.ipynb`** and run all cells. This will:
 
 Note the endpoint's base URL and CDP token — you'll need them for `CLF_ENDPOINT_BASE_URL` and `CLF_CDP_TOKEN` in the next step.
 
+> **Alternative — PyTorch classifier.** If the XGBoost/ONNX conversion path is broken in your CAI environment, `pytorch_train/01_train_pytorch_onnx.ipynb` + `pytorch_train/02_deploy_pytorch_ai_inf.ipynb` train and deploy the equivalent 8-feature customer-risk model as a small PyTorch net exported to ONNX. It registers as `nba-risk-onnx-pytorch` and serves the same `(label, probabilities)` response shape as the XGBoost endpoint, so pointing `CLF_MODEL_ID` at it requires no code changes in the app.
+
 ### Step 4 — Run the offline LangSmith evaluations
 
 With `LANGSMITH_API_KEY`, `LANGSMITH_PROJECT`, and the LLM/XGBoost endpoint env vars set, run these notebooks **in order** from the repo root:
@@ -191,6 +193,8 @@ Alert patterns to configure in LangSmith: drop in `offer_relevance` mean, spike 
 | `launch_app.py` | Cloudera AI Application entry point (stays at repo root so CAI's Application `Script` field is `launch_app.py`) |
 | `xgboost/01_train_xgboost_onnx.ipynb` | Trains the customer-risk XGBoost classifier off SQLite and registers it as `nba-risk-onnx-xgboost` |
 | `xgboost/02_deploy_xgboost_ai_inf.ipynb` | Deploys the registered model to the `nba-risk-endpoint` CAI Inference endpoint + smoke-tests it |
+| `pytorch_train/01_train_pytorch_onnx.ipynb` | Alternative — trains an 8-feature PyTorch NN off the same SQLite data, exports to ONNX, and registers as `nba-risk-onnx-pytorch` (+ raw PyTorch model as `nba-risk-pytorch`) |
+| `pytorch_train/02_deploy_pytorch_ai_inf.ipynb` | Deploys `nba-risk-onnx-pytorch` to the `nba-risk-pytorch-endpoint` CAI Inference endpoint + smoke-tests it |
 | `nba_dataset_upload.ipynb` | Uploads scripted multi-turn examples |
 | `nba_evaluators.ipynb` | 4 evaluators (2 deterministic, 2 LLM-as-judge) |
 | `nba_experiments.ipynb` | `evaluate()` calls with replay target |
