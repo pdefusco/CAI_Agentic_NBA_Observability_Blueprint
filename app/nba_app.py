@@ -910,7 +910,44 @@ def _build_graph():
     return builder.compile(checkpointer=MemorySaver())
 
 
-graph = _build_graph()
+# Compiled graph singleton.  This module is run by `streamlit run nba_app.py`,
+# which re-executes the entire script on every user interaction — if we
+# constructed the graph at module top level naively, each user message would
+# get a brand-new ``MemorySaver`` and no thread state would ever persist.  We
+# therefore keep the compiled graph in Streamlit's cross-rerun cache when
+# Streamlit is available, and fall back to a plain module-level singleton for
+# other callers (evaluators, tests).
+_graph_singleton = None
+
+
+def get_graph():
+    """Return the compiled LangGraph, cached across Streamlit reruns.
+
+    ``@st.cache_resource`` scopes to the Streamlit *server process*, which
+    is exactly what we want: the ``MemorySaver`` inside the graph keeps
+    every thread's checkpoint alive as long as the CAI Application process
+    is up.  Restart the app to clear it.
+    """
+    global _graph_singleton
+    try:
+        import streamlit as st
+
+        @st.cache_resource
+        def _cached_graph():
+            return _build_graph()
+
+        return _cached_graph()
+    except Exception:
+        # No Streamlit context (e.g. imported by an evaluator).  Fall back
+        # to a plain module-level singleton — same process = same graph.
+        if _graph_singleton is None:
+            _graph_singleton = _build_graph()
+        return _graph_singleton
+
+
+# Backwards-compat alias for code that imports ``graph`` directly.  This
+# resolves to the cached singleton the first time it is read.
+graph = get_graph()
 
 
 # ----------------------------------------------------------------------
@@ -942,7 +979,12 @@ def run_turn(
     if customer_id is not None:
         input_state["customer_id"] = customer_id
 
-    final_state = graph.invoke(input_state, config=config)
+    # Always resolve via ``get_graph()`` so the cached singleton is used
+    # across Streamlit reruns.  Reading the module-level ``graph`` name
+    # would bind to whatever value existed the first time this function
+    # was compiled — which on Streamlit's exec-per-rerun model is usually
+    # a graph from a discarded MemorySaver.
+    final_state = get_graph().invoke(input_state, config=config)
 
     rt = get_current_run_tree()
     run_id = str(rt.id) if rt else None
