@@ -10,11 +10,16 @@
 """Next-Best-Action multi-turn chatbot demo.
 
 A LangGraph pipeline that guides a bank customer through a short conversation,
-polls an XGBoost fraud-guardrail endpoint on Cloudera AI Inference Service,
+polls an XGBoost customer-risk guardrail on Cloudera AI Inference Service,
 consults a local SQLite rule engine of credit-card offers, and presents the
 best-fit offer in-chat.  Fully traced through LangSmith with a per-thread
 ``thread_id`` so the entire conversation appears as one thread in the
 LangSmith Threads tab.
+
+The risk guardrail is a binary XGBoost classifier trained on
+``customers.risk_tier`` (see ``xgboost/01_train_xgboost_onnx.ipynb``); its
+feature vector is built from ``state["customer_record"]`` at guardrail time,
+not from LLM-extracted chat features.
 
 Runs as a Cloudera AI Application via ``launch_app.py``.
 """
@@ -57,12 +62,16 @@ LLM_MODEL_ID = os.environ.get("LLM_MODEL_ID", "nemotron")
 LLM_ENDPOINT_BASE_URL = os.environ.get("LLM_ENDPOINT_BASE_URL", "")
 LLM_CDP_TOKEN = os.environ.get("LLM_CDP_TOKEN", "")
 
-# Classifier (XGBoost fraud model on Cloudera AI Inference Service)
-CLF_MODEL_ID = os.environ.get("CLF_MODEL_ID", "xgboost")
+# Classifier (XGBoost customer-risk model on Cloudera AI Inference Service)
+CLF_MODEL_ID = os.environ.get("CLF_MODEL_ID", "nba-risk-onnx-xgboost")
 CLF_ENDPOINT_BASE_URL = os.environ.get("CLF_ENDPOINT_BASE_URL", "")
 CLF_CDP_TOKEN = os.environ.get("CLF_CDP_TOKEN", "")
 
-FRAUD_THRESHOLD = float(os.environ.get("FRAUD_THRESHOLD", "0.5"))
+# Threshold for the customer-risk guardrail.  FRAUD_THRESHOLD is kept as an
+# alias so existing deploy scripts continue to work.
+HIGH_RISK_THRESHOLD = float(
+    os.environ.get("HIGH_RISK_THRESHOLD", os.environ.get("FRAUD_THRESHOLD", "0.5"))
+)
 NBA_MOCK = os.environ.get("NBA_MOCK", "") == "1"
 
 # LangSmith URLs (for UI links from the sidebar)
@@ -100,15 +109,13 @@ def get_llm(temperature: float = 0.2) -> ChatOpenAI:
 
 
 class Features(BaseModel):
-    """Features extracted from a single customer message.
+    """Features extracted from the customer's chat messages.
 
-    Retains the 14 fields the fraud XGBoost model expects so the payload
-    shape is unchanged from the original demo.  Adds NBA-specific fields
-    (age, annual_income, requested_credit_line, ...) used by the rule
-    engine and clarifying-question prompts.
+    Used by the clarifying-question prompt and passed to the offer rule
+    engine for personalization.  The XGBoost risk guardrail no longer reads
+    from here — it looks up the customer row directly from SQLite.
     """
 
-    # NBA-specific
     age: int = Field(default=0)
     annual_income: float = Field(default=0)
     requested_credit_line: float = Field(default=0)
@@ -119,21 +126,6 @@ class Features(BaseModel):
     monthly_spend: float = Field(default=0)
     stated_goal: str = Field(default="")
 
-    # Fraud-classifier features (payload shape must match the XGBoost endpoint).
-    credit_card_balance: float = 0
-    bank_account_balance: float = 0
-    mortgage_balance: float = 0
-    sec_bank_account_balance: float = 0
-    savings_account_balance: float = 0
-    sec_savings_account_balance: float = 0
-    total_est_nworth: float = 0
-    primary_loan_balance: float = 0
-    secondary_loan_balance: float = 0
-    uni_loan_balance: float = 0
-    longitude: float = 0
-    latitude: float = 0
-    transaction_amount: float = 0
-
 
 class Intent(BaseModel):
     """Router decision emitted after every user turn."""
@@ -142,22 +134,16 @@ class Intent(BaseModel):
     reasoning: str = ""
 
 
+# XGBoost risk-guardrail feature order.  MUST match the training order used
+# in xgboost/01_train_xgboost_onnx.ipynb — the one-hot suffixes come from
+# pii_datagen._EMP_STATUSES.  Mirrored here (rather than imported) so the app
+# module can be traced without dragging in Faker.
+_EMP_STATUSES = ["EMPLOYED", "SELF_EMPLOYED", "STUDENT", "UNEMPLOYED", "RETIRED"]
 FEATURE_ORDER = [
     "age",
-    "credit_card_balance",
-    "bank_account_balance",
-    "mortgage_balance",
-    "sec_bank_account_balance",
-    "savings_account_balance",
-    "sec_savings_account_balance",
-    "total_est_nworth",
-    "primary_loan_balance",
-    "secondary_loan_balance",
-    "uni_loan_balance",
-    "longitude",
-    "latitude",
-    "transaction_amount",
-]
+    "annual_income",
+    "existing_debt",
+] + [f"emp_{s}" for s in _EMP_STATUSES]
 
 
 # ----------------------------------------------------------------------
@@ -178,11 +164,6 @@ Extract these fields from the user's latest message:
 - employment_status ("EMPLOYED"|"SELF_EMPLOYED"|"STUDENT"|"UNEMPLOYED"|"RETIRED"|"UNKNOWN")
 - monthly_spend (float)
 - stated_goal (short free-text summary of what the customer wants)
-- credit_card_balance, bank_account_balance, mortgage_balance,
-  sec_bank_account_balance, savings_account_balance,
-  sec_savings_account_balance, total_est_nworth, primary_loan_balance,
-  secondary_loan_balance, uni_loan_balance, longitude, latitude,
-  transaction_amount (all floats)
 
 Rules:
 - If a value is not stated, return 0 (or "UNKNOWN" for employment_status, "" for stated_goal).
@@ -314,10 +295,10 @@ decline_prompt = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            """You are a banking assistant.  Our fraud guardrail flagged this
-session as unusual.  Reply politely, do NOT reveal the fraud score, and
-suggest the customer verify recent activity in their banking app or contact
-support.  Under 80 words.  Chat tone.
+            """You are a banking assistant.  Our risk guardrail flagged this
+session as high-risk.  Reply politely, do NOT reveal the risk score, and
+suggest the customer verify their information or contact support to review
+their options.  Under 80 words.  Chat tone.
 """,
         ),
         ("human", "Conversation so far:\n{transcript}"),
@@ -335,8 +316,8 @@ class GraphState(TypedDict, total=False):
     thread_id: str
     customer_id: Optional[int]
     accumulated_features: Dict[str, Any]
-    fraud_probability: Optional[float]
-    fraud_blocked: bool
+    high_risk_probability: Optional[float]
+    risk_blocked: bool
     customer_record: Optional[Dict[str, Any]]
     selected_offer: Optional[Dict[str, Any]]
     candidate_offers: Optional[List[Dict[str, Any]]]
@@ -407,22 +388,25 @@ def _load_customer(customer_id: Optional[int]) -> Dict[str, Any]:
 
 
 # ----------------------------------------------------------------------
-# XGBoost fraud call (unchanged payload shape from the original demo)
+# XGBoost customer-risk call
 # ----------------------------------------------------------------------
 
 
 @traceable(run_type="tool", name="xgboost_infer")
 def _xgboost_infer(features: Dict[str, Any]) -> float:
-    """Poll the Cloudera AI Inference Service XGBoost endpoint.
+    """Poll the Cloudera AI Inference Service customer-risk endpoint.
 
-    Returns the P(fraud) probability. When NBA_MOCK=1, short-circuits so
-    the demo can run without a live endpoint.
+    Returns P(high_risk).  When NBA_MOCK=1 or no endpoint is configured,
+    short-circuits so the demo can run without a live model.
     """
     if NBA_MOCK or not CLF_ENDPOINT_BASE_URL:
-        # In mock mode a large transaction_amount trips the guardrail so the
+        # Mock heuristic: debt-to-income above 0.4 scores as "high risk" so the
         # decline path is exercisable end-to-end without a live endpoint.
-        txn = float(features.get("transaction_amount", 0) or 0)
-        return 0.9 if txn > 5_000 else 0.05
+        income = float(features.get("annual_income", 0) or 0)
+        debt = float(features.get("existing_debt", 0) or 0)
+        if income > 0 and debt / income > 0.4:
+            return 0.85
+        return 0.05
 
     headers = {
         "Authorization": f"Bearer {CLF_CDP_TOKEN}",
@@ -454,11 +438,11 @@ def _xgboost_infer(features: Dict[str, Any]) -> float:
     )
     latency = time.time() - start
     resp_json = json.loads(pred.json())
-    # Preserved from the original: fraud probability is the second element
-    # of the second output row.
-    fraud_proba = float(resp_json["outputs"][1]["data"][1])
-    print(f"[xgboost_infer] fraud_proba={fraud_proba:.4f} latency={latency:.2f}s")
-    return fraud_proba
+    # P(high_risk) = second element of the probabilities output.  Output shape
+    # [-1, 2] is preserved by the binary target used at train time.
+    high_risk_proba = float(resp_json["outputs"][1]["data"][1])
+    print(f"[xgboost_infer] high_risk_proba={high_risk_proba:.4f} latency={latency:.2f}s")
+    return high_risk_proba
 
 
 # ----------------------------------------------------------------------
@@ -468,9 +452,13 @@ def _xgboost_infer(features: Dict[str, Any]) -> float:
 
 @traceable(run_type="chain", name="intake_node")
 def intake_node(state: GraphState) -> Dict[str, Any]:
-    """First node every turn: extract features from the latest user message
-    and merge them into the running feature dict.  Also lazy-loads the
-    customer record on the first turn of the thread.
+    """First node every turn: extract offer-personalization features from the
+    latest user message and merge them into the running feature dict.  Also
+    lazy-loads the customer record on the first turn of the thread.
+
+    Note: the fields extracted here feed the clarifying-question prompt and
+    the offer rule engine.  The XGBoost risk guardrail reads directly from
+    ``state["customer_record"]`` and does not depend on this node.
     """
     latest_user = ""
     for m in reversed(state.get("messages", [])):
@@ -478,27 +466,10 @@ def intake_node(state: GraphState) -> Dict[str, Any]:
             latest_user = m.content
             break
 
-    features_chain = feature_prompt | get_llm().with_structured_output(Features)
     if NBA_MOCK:
-        # Skip a live LLM call in mock mode; return a fixed profile.  A
-        # heuristic pattern-match on the user text lets the demo exercise
-        # the fraud path without a live endpoint — any turn that mentions a
-        # large transaction amount populates ``transaction_amount`` so the
-        # mocked XGBoost stub trips the guardrail.
-        import re
-        txn_amount = 0.0
-        for pat in (
-            r"\$\s*([\d,]+(?:\.\d+)?)\s*k?",
-            r"([\d,]+)\s*dollars?",
-            r"transaction[^\d]*([\d,]+)",
-            r"amount[^\d]*([\d,]+)",
-        ):
-            m = re.search(pat, latest_user, flags=re.I)
-            if m:
-                try:
-                    txn_amount = max(txn_amount, float(m.group(1).replace(",", "")))
-                except ValueError:
-                    pass
+        # Skip a live LLM call in mock mode; return a fixed chat-derived
+        # profile.  The customer risk (and thus the decline path) is driven
+        # by the looked-up ``customer_record``, not by anything here.
         extracted = Features(
             age=42,
             annual_income=180_000,
@@ -506,10 +477,10 @@ def intake_node(state: GraphState) -> Dict[str, Any]:
             existing_debt=5_000,
             employment_status="EMPLOYED",
             monthly_spend=4_000,
-            transaction_amount=txn_amount,
             stated_goal=latest_user[:80],
         )
     else:
+        features_chain = feature_prompt | get_llm().with_structured_output(Features)
         extracted = features_chain.invoke({"input": latest_user})
 
     new_features = extracted.dict() if hasattr(extracted, "dict") else dict(extracted)
@@ -528,34 +499,45 @@ def intake_node(state: GraphState) -> Dict[str, Any]:
     return updates
 
 
-@traceable(run_type="chain", name="fraud_guardrail_node")
-def fraud_guardrail_node(state: GraphState) -> Dict[str, Any]:
-    """Poll the XGBoost fraud model once per thread (results cached).
+@traceable(run_type="chain", name="risk_guardrail_node")
+def risk_guardrail_node(state: GraphState) -> Dict[str, Any]:
+    """Poll the XGBoost customer-risk endpoint once per thread (cached).
 
-    Skips the call if we haven't accumulated any financial features yet —
-    an all-zero payload is not informative and burns endpoint quota.
+    The feature vector is built from ``state["customer_record"]`` (loaded by
+    ``_load_customer``) rather than from LLM-extracted chat features, so we
+    always send a well-formed 8-element vector.  If the customer_id is
+    unknown and no row was loaded, skip the call and pass through.
     """
-    if state.get("fraud_probability") is not None:
+    if state.get("high_risk_probability") is not None:
         return {}
 
-    features = state.get("accumulated_features", {}) or {}
-    financial_signal = sum(
-        float(features.get(f, 0) or 0) for f in FEATURE_ORDER if f != "age"
-    )
-    if financial_signal == 0 and not NBA_MOCK:
-        # Not enough info to run the classifier — assume low fraud until
-        # more features come in on later turns.
-        return {"fraud_probability": 0.0, "fraud_blocked": False}
+    customer = state.get("customer_record") or {}
+    if not customer:
+        # No customer looked up — nothing to score.  Assume low risk so the
+        # graph continues to the intent router.
+        return {"high_risk_probability": 0.0, "risk_blocked": False}
+
+    # Build the feature vector to match training.  employment_status is
+    # one-hot-encoded; an unknown status lands at an all-zero one-hot block,
+    # which the model handles fine.
+    features: Dict[str, Any] = {
+        "age": float(customer.get("age", 0) or 0),
+        "annual_income": float(customer.get("annual_income", 0) or 0),
+        "existing_debt": float(customer.get("existing_debt", 0) or 0),
+    }
+    emp = str(customer.get("employment_status", "") or "").upper()
+    for status in _EMP_STATUSES:
+        features[f"emp_{status}"] = 1.0 if emp == status else 0.0
 
     proba = _xgboost_infer(features)
     return {
-        "fraud_probability": proba,
-        "fraud_blocked": proba >= FRAUD_THRESHOLD,
+        "high_risk_probability": proba,
+        "risk_blocked": proba >= HIGH_RISK_THRESHOLD,
     }
 
 
-def fraud_router(state: GraphState) -> Literal["decline", "continue"]:
-    return "decline" if state.get("fraud_blocked") else "continue"
+def risk_router(state: GraphState) -> Literal["decline", "continue"]:
+    return "decline" if state.get("risk_blocked") else "continue"
 
 
 @traceable(run_type="chain", name="intent_router_node")
@@ -733,7 +715,7 @@ def decline_node(state: GraphState) -> Dict[str, Any]:
         chain = decline_prompt | get_llm()
         content = chain.invoke({"transcript": transcript}).content
 
-    return {"messages": [AIMessage(content=content)], "fraud_blocked": True}
+    return {"messages": [AIMessage(content=content)], "risk_blocked": True}
 
 
 # ----------------------------------------------------------------------
@@ -744,7 +726,7 @@ def decline_node(state: GraphState) -> Dict[str, Any]:
 def _build_graph():
     builder = StateGraph(GraphState)
     builder.add_node("intake", intake_node)
-    builder.add_node("fraud_guardrail", fraud_guardrail_node)
+    builder.add_node("risk_guardrail", risk_guardrail_node)
     builder.add_node("intent_router", intent_router_node)
     builder.add_node("clarify", clarify_node)
     builder.add_node("select_offer", offer_selection_node)
@@ -753,10 +735,10 @@ def _build_graph():
     builder.add_node("decline", decline_node)
 
     builder.set_entry_point("intake")
-    builder.add_edge("intake", "fraud_guardrail")
+    builder.add_edge("intake", "risk_guardrail")
     builder.add_conditional_edges(
-        "fraud_guardrail",
-        fraud_router,
+        "risk_guardrail",
+        risk_router,
         {"decline": "decline", "continue": "intent_router"},
     )
     builder.add_conditional_edges(
@@ -824,8 +806,8 @@ def run_turn(
         "messages": final_state.get("messages", []),
         "selected_offer": final_state.get("selected_offer"),
         "candidate_offers": final_state.get("candidate_offers"),
-        "fraud_probability": final_state.get("fraud_probability"),
-        "fraud_blocked": final_state.get("fraud_blocked", False),
+        "high_risk_probability": final_state.get("high_risk_probability"),
+        "risk_blocked": final_state.get("risk_blocked", False),
         "conversation_stage": final_state.get("conversation_stage"),
         "accumulated_features": final_state.get("accumulated_features", {}),
         "customer_record": final_state.get("customer_record"),
@@ -899,9 +881,9 @@ def run_streamlit_app() -> None:
         if last is not None:
             st.write("Stage:", last.get("conversation_stage"))
             st.write(
-                "Fraud probability:",
-                f"{last.get('fraud_probability'):.2%}"
-                if last.get("fraud_probability") is not None
+                "High-risk probability:",
+                f"{last.get('high_risk_probability'):.2%}"
+                if last.get("high_risk_probability") is not None
                 else "n/a",
             )
             if last.get("selected_offer"):
