@@ -929,6 +929,10 @@ def run_turn(
         "conversation_stage": final_state.get("conversation_stage"),
         "accumulated_features": final_state.get("accumulated_features", {}),
         "customer_record": final_state.get("customer_record"),
+        # Surfaced so the Streamlit sidebar can confirm the cap counter is
+        # advancing — if this stays at None across turns, the deployed app is
+        # running a build older than commit 4968e00.
+        "clarify_count": final_state.get("clarify_count"),
     }
 
 
