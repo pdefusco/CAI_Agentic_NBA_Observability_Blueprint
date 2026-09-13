@@ -1,24 +1,55 @@
-# NBA Chatbot — a Cloudera AI blueprint for evaluated, observed multi-agent apps with LangSmith
+# Cloudera Blueprint: NBA Chatbot — Evaluated, Observed Multi-Agent Apps on Cloudera AI with LangSmith
 
-A reusable blueprint for building a **Next-Best-Action** credit-card recommender as a **multi-turn chatbot** on **Cloudera AI**, powered by a **LangGraph** multi-agent workflow, guarded by a customer-risk check, and fully instrumented with **LangSmith** for offline evaluation and online monitoring.
+> A reusable blueprint for building a **Next-Best-Action** credit-card recommender as a **multi-turn chatbot** on **Cloudera AI**, powered by a **LangGraph** multi-agent workflow, guarded by a customer-risk check, and fully instrumented with **LangSmith** for offline evaluation and online monitoring.
 
-The demo user plays a bank customer: they open a chat, state their reason for contacting, and the bot asks clarifying questions until it has enough context to present the best-fit offer conversationally. The user can then keep chatting to ask follow-ups about the offer.
+## Table of Contents
 
-> **Guardrail status.** The customer-risk guardrail currently runs as a small **rules-based placeholder** in `app/nba_app.py` (`_rules_based_risk_score`) — no model endpoint required. An ML-backed guardrail (XGBoost / PyTorch → ONNX → CAI Inference Service) is scaffolded under `xgboost/` and `pytorch_train/` and can be re-enabled by swapping the call in `risk_guardrail_node`. Steps 2–3 below describe the ML path and are optional while the rules-based guardrail is in use.
+- [Overview](#overview)
+- [Demo](#demo)
+- [Use Case](#use-case)
+- [Key Features](#key-features)
+- [Quickstart / Guide](#quickstart--guide)
+- [Architecture / Software Components](#architecture--software-components)
+- [Target Audience](#target-audience)
+- [Repository Structure](#repository-structure)
+- [Prerequisites](#prerequisites)
+- [Hardware Requirements](#hardware-requirements)
+- [Documentation](#documentation)
 
----
+## Overview
 
-## What this demo does
+This blueprint shows how to build, evaluate, and observe a **production-grade multi-agent chatbot** entirely on Cloudera AI. The demo user plays a bank customer: they open a chat, state their reason for contacting, and a **LangGraph** multi-agent system asks clarifying questions until it has enough context to present the best-fit credit-card offer. A customer-risk guardrail short-circuits the workflow into a polite decline for HIGH-risk profiles. Every turn is traced to **LangSmith** with per-thread grouping and thumbs feedback, and three notebooks turn scripted conversations into repeatable **offline evaluations** with deterministic and LLM-as-judge scorers. The stack — Nemotron on **Cloudera AI Inference Service**, LangGraph checkpointer state, Streamlit UI hosted as a **Cloudera AI Application**, and an optional XGBoost/PyTorch ONNX risk classifier — is the reference wiring for any evaluated agentic app on the Cloudera platform.
 
-1. **Multi-turn conversation.** LangGraph state is checkpointed per `thread_id`; each turn re-enters the graph at `intake` and either asks a clarifying question, presents an offer, or answers a follow-up.
-2. **Customer-risk guardrail.** A rules-based check runs once per thread against `state["customer_record"]` (age, annual_income, existing_debt, employment_status, risk_tier). If any rule fires — `risk_tier == HIGH`, debt-to-income > 0.6, or unemployed with material existing debt — the workflow short-circuits into a polite decline. The ML-backed variant (see `xgboost/` and `pytorch_train/`) is a drop-in replacement when you're ready.
-3. **Rule-engine of 5 offers** stored in local SQLite (`nba_demo.db`). SQL filter + Python re-scoring picks the top-K offer for the customer's stated needs + PII record.
-4. **Offline evaluation** in three notebooks (`nba_dataset_upload → nba_evaluators → nba_experiments`) that upload scripted multi-turn conversations, define deterministic + LLM-as-judge evaluators, and run comparable experiments.
-5. **Online monitoring** via `@traceable` and per-turn `thread_id` metadata — every turn is one traced graph invocation, and LangSmith's **Threads** tab groups them into a single conversation. 👍/👎 feedback under each assistant reply lands on the correct turn's `run_id`.
+> **Guardrail status.** The customer-risk guardrail currently runs as a small **rules-based placeholder** in `app/nba_app.py` (`_rules_based_risk_score`) — no model endpoint required. An ML-backed guardrail (XGBoost / PyTorch → ONNX → CAI Inference Service) is scaffolded under `xgboost/` and `pytorch_train/` and can be re-enabled by swapping the call in `risk_guardrail_node`. Steps 2–3 of the Quickstart describe the ML path and are optional while the rules-based guardrail is in use.
 
----
+## Demo
 
-## How to run this demo end-to-end
+A representative interaction with the deployed chatbot on Cloudera AI. The customer (Allison Hill, LOW-risk tier, $106K income) asks to upgrade their card. The bot asks two clarifying questions — reason for change, then income — hits the `Clarify turns: 2 / 3` cap, and pitches **Cashback Everyday** (2% cash back, 18.99–25.99% APR). The debug pane on the right shows the graph stage (`offer_presented`), the guardrail's high-risk probability (4.19%), and the selected offer id (`CASHBACK_EVERYDAY`). Thumbs feedback under the reply lands on the correct per-turn `run_id` in LangSmith.
+
+![NBA chatbot end-to-end interaction on Cloudera AI](img/nba-chat-demo.png)
+
+## Use Case
+
+Banks routinely pitch card upgrades and cross-sells to customers via chat, but three requirements block naive LLM chatbots from serving that traffic:
+
+1. **Regulated recommendations.** Every offer presented must be tied to a rule-based eligibility check (risk tier, age, income) — not the LLM's judgment alone.
+2. **Fail-safe decline path.** HIGH-risk customers must be routed to a polite decline that quotes no specific product figures and redirects to a human agent.
+3. **Auditability.** Product, risk, and compliance teams need to inspect every conversation turn-by-turn, replay them against new prompts, and grade them offline before promoting a model change.
+
+This blueprint implements all three: a **multi-turn LangGraph agent** does the conversational work; a **rule engine** over a SQLite offer catalog picks the concrete offer; a **customer-risk guardrail** short-circuits HIGH-risk customers into `decline`; and **LangSmith** captures traces, groups them into threads, and runs the three offline evaluation notebooks that grade correctness, guardrail behavior, offer relevance, and conversation quality on scripted golden conversations. The business outcome is a conversational NBA channel that a compliance team can approve.
+
+## Key Features
+
+- **Multi-turn LangGraph MAS.** `intake → risk_guardrail → intent_router → {clarify | select_offer → offer_presentation | post_offer_chat | decline}` with `MemorySaver` checkpointer keyed on `thread_id`. Hard cap of 3 clarifying questions before an offer is forced.
+- **Customer-risk guardrail** with a rules-based placeholder today and drop-in ONNX endpoints (XGBoost or PyTorch) already scaffolded.
+- **Rule-engine offer selection** over 5 seeded offers stored in SQLite (`nba_demo.db`) — SQL eligibility filter + Python re-scoring by stated goal.
+- **LangSmith tracing on every turn**: root run per `run_turn(...)` with nested runs for each node, tagged with `thread_id` metadata so LangSmith's **Threads** tab groups them into one conversation.
+- **👍/👎 feedback** below every assistant reply, written to the correct per-turn `run_id`.
+- **Offline evaluations** (3 notebooks) with deterministic scorers (`correct_offer_selection`, `guardrail_correctness`) and LLM-as-judge scorers (`offer_relevance_llm_judge`, `conversation_quality_llm_judge`) — Nemotron via structured output.
+- **Comparable experiments side-by-side**: temperature sweeps, per-split runs, `num_repetitions` for stability — all as `client.evaluate(...)` calls on the same golden dataset.
+- **Cloudera-native deployment.** Streamlit app hosted as a **Cloudera AI Application**; LLM served by **Cloudera AI Inference Service**; optional ONNX risk classifier served by **CAI Inference** as well.
+
+## Quickstart / Guide
 
 Follow these steps in order the first time you set up the demo. Each step depends on the previous one.
 
@@ -70,6 +101,8 @@ With `LANGSMITH_API_KEY`, `LANGSMITH_PROJECT`, and the LLM/XGBoost endpoint env 
 2. **`nba_evaluators.ipynb`** — defines the 4 evaluators (`correct_offer_selection`, `guardrail_correctness`, `offer_relevance_llm_judge`, `conversation_quality_llm_judge`).
 3. **`nba_experiments.ipynb`** — replays every scripted conversation turn-by-turn against the compiled LangGraph (importing `run_turn` from `app/nba_app.py`) and grades the final state. Runs several experiments side-by-side so you can compare temperature and split cuts.
 
+Acceptance targets at temperature 0.2: `correct_offer >= 0.7`, `guardrail_correct == 1.0`, `offer_relevance >= 7/10`.
+
 ### Step 5 — Deploy the chatbot and try it live
 
 Launch the Streamlit app as a Cloudera AI Application pointing at **`launch_app.py`** (which boots `app/nba_app.py`).
@@ -89,7 +122,7 @@ Scripted turns to send once you've picked a customer:
 - **Post-offer follow-up** → *"What's the annual fee?"* — routes to `post_offer_chat` using the offer already in state.
 - **New conversation** → click **"New conversation"** in the sidebar to start a fresh `thread_id` (the customer stays selected).
 
-Every turn is a `run_turn(...)` invocation tagged with `thread_id` metadata, so each conversation shows up as a single thread in LangSmith.
+Every turn is a `run_turn(...)` invocation tagged with `thread_id` metadata, so each conversation shows up as a single thread in LangSmith. The Demo screenshot above is the reference for what a successful "LOW-risk customer, 3-turn conversation ending in an offer" run looks like.
 
 ### Step 6 — Inspect traces in the LangSmith UI
 
@@ -100,9 +133,17 @@ Open your LangSmith project and:
 - Click through to a run and confirm the 👍/👎 feedback buttons you clicked in the app show up as feedback on the correct per-turn `run_id`.
 - Compare the offline experiment runs from Step 4 side-by-side under the **Experiments** tab of the `NBA Golden Dataset`.
 
----
+## Architecture / Software Components
 
-## Architecture
+The demo is composed of five Cloudera / third-party components:
+
+- **LangGraph MAS** — a `StateGraph` compiled with `MemorySaver` checkpointer keyed on `thread_id`. All nodes are `@traceable`, and the whole per-turn invocation is wrapped by `run_turn(...)` which becomes the LangSmith root run for that turn.
+- **Cloudera AI Inference Service — Nemotron LLM endpoint** — powers every LLM step (feature extraction, intent routing, clarifying questions, offer pitches, decline text, and both LLM-as-judge evaluators). OpenAI-compatible.
+- **Cloudera AI Inference Service — ONNX classifier endpoint (optional)** — hosts the customer-risk XGBoost or PyTorch model when the ML guardrail is enabled.
+- **SQLite (`nba_demo.db`)** — offer catalog + synthetic customer PII table. Reachable from both the app and the notebooks because it lives at repo root.
+- **LangSmith** — trace collection, thread grouping, thumbs feedback storage, offline experiments (`client.evaluate(...)`), and optional online evaluators attached in the UI.
+
+### Runtime data flow
 
 ```
                                            ┌──────────────────┐
@@ -134,13 +175,9 @@ Open your LangSmith project and:
      selected_offer, conversation_stage
 ```
 
-All nodes are `@traceable`. The whole per-turn invocation is wrapped by `run_turn(...)` which becomes the LangSmith root run for that turn, tagged with `thread_id` metadata so LangSmith's Threads tab can group turns.
+### MAS workflow (graph)
 
----
-
-## MAS Workflow
-
-The multi-agent system is a LangGraph `StateGraph` compiled with a `MemorySaver` checkpointer. Each user turn re-enters the graph at `intake` and follows one of four paths to `END`: **decline** (guardrail fired), **clarify** (need more info), **offer_presentation** (via `select_offer`), or **post_offer_chat** (offer already on the table, customer is asking follow-ups). Solid arrows are unconditional transitions; dashed arrows are conditional routes emitted by the two routers (`risk_router` after the guardrail, `stage_router` after the intent router).
+Each user turn re-enters the graph at `intake` and follows one of four paths to `END`: **decline** (guardrail fired), **clarify** (need more info), **offer_presentation** (via `select_offer`), or **post_offer_chat** (offer already on the table, customer is asking follow-ups). Solid arrows are unconditional transitions; dashed arrows are conditional routes emitted by the two routers (`risk_router` after the guardrail, `stage_router` after the intent router).
 
 ```mermaid
 ---
@@ -199,11 +236,54 @@ NBA_MOCK=1 python scripts/export_graph_mermaid.py
 
 That writes `img/nba_graph.mmd` and prints the same Mermaid text you see in the fenced block above. When you add or rewire a node in `app/nba_app.py:_build_graph`, re-run the script and paste the updated block back in here.
 
----
+## Target Audience
 
-## Environment variables
+- **Solution architects & SEs** — reference wiring for an evaluated, observed agentic app on Cloudera AI they can adapt to a customer's own dataset.
+- **ML / GenAI engineers** — end-to-end template for combining LangGraph state machines with LangSmith evaluators (deterministic + LLM-as-judge) and ONNX-served classifiers on CAI Inference.
+- **Compliance / risk stakeholders** — a working example of a **guarded** GenAI recommendation flow with an inspectable decline path and per-turn trace evidence.
+- **Product managers piloting conversational NBA** — a starting point for user studies on multi-turn recommendation UX before committing to a heavy production build.
 
-Copy `.env.example` to `.env` and fill in:
+## Repository Structure
+
+| Path | Description |
+|---|---|
+| `app/nba_app.py` | LangGraph chatbot + Streamlit UI. Hosts `_rules_based_risk_score`, the current placeholder guardrail. |
+| `app/db.py` | SQLite schema + offer seeding (DB file `nba_demo.db` sits at the project root so both the app and the notebooks can reach it). |
+| `app/offer_rules.py` | Rule-engine (SQL filter + Python re-scoring). |
+| `app/pii_datagen.py` | Faker-based customer seeder (`--ensure`, `--rows`). |
+| `launch_app.py` | Cloudera AI Application entry point (stays at repo root so CAI's Application `Script` field is `launch_app.py`). |
+| `scripts/export_graph_mermaid.py` | Regenerates the MAS Mermaid diagram from the compiled `StateGraph`. |
+| `xgboost/01_train_xgboost_onnx.ipynb` | **Optional (ML guardrail path).** Trains the customer-risk XGBoost classifier off SQLite and registers it as `nba-risk-onnx-xgboost`. |
+| `xgboost/02_deploy_xgboost_ai_inf.ipynb` | **Optional (ML guardrail path).** Deploys the registered model to the `nba-risk-endpoint` CAI Inference endpoint + smoke-tests it. |
+| `pytorch_train/01_train_pytorch_onnx.ipynb` | **Optional (ML guardrail path).** Alternative to XGBoost — trains an 8-feature PyTorch NN, exports to ONNX, and registers as `nba-risk-onnx-pytorch` (+ raw PyTorch model as `nba-risk-pytorch`). |
+| `pytorch_train/02_deploy_pytorch_ai_inf.ipynb` | **Optional (ML guardrail path).** Deploys `nba-risk-onnx-pytorch` to the `nba-risk-pytorch-endpoint` CAI Inference endpoint + smoke-tests it. |
+| `nba_dataset_upload.ipynb` | Uploads scripted multi-turn examples to LangSmith as `NBA Golden Dataset`. |
+| `nba_evaluators.ipynb` | 4 evaluators (2 deterministic, 2 LLM-as-judge). |
+| `nba_experiments.ipynb` | `evaluate()` calls with the replay target function; runs the side-by-side experiments. |
+| `img/` | Diagrams and screenshots (including the Demo screenshot above and `nba_graph.mmd`). |
+| `.env.example` | Env-var template. |
+| `METADATA.yaml` | Catalog metadata for the Cloudera blueprint website. |
+| `utils.py`, `tracing_basics.ipynb`, `dataset_upload.ipynb`, `evaluators.ipynb`, `experiments.ipynb`, `types_of_runs.ipynb`, `conversational_threads.ipynb` | Reference material from the LangSmith course, unmodified. |
+
+## Prerequisites
+
+**Cloudera platform**
+
+- A **Cloudera AI Workbench** project with terminal + notebook access.
+- A **Cloudera AI Inference Service** entitlement, with a **Nemotron** (or any OpenAI-compatible) LLM endpoint provisioned. Note the base URL and CDP token.
+- (Optional, ML guardrail path only) An **AI Registry** and the ability to deploy an ONNX endpoint on CAI Inference.
+
+**External services**
+
+- A **LangSmith** account and API key (organization/project set up).
+
+**Tooling**
+
+- Python 3.10+ (already provided by CAI runtimes).
+- `git`.
+- Python packages from `requirements.txt` (installed inside the CAI session).
+
+**Configuration.** Copy `.env.example` to `.env` and fill in:
 
 | Var | Purpose |
 |---|---|
@@ -223,20 +303,28 @@ Copy `.env.example` to `.env` and fill in:
 | `LANGSMITH_ORG` | Org slug/uuid — only used to render "open in LangSmith" links |
 | `PROJECT_OWNER` | Free-form owner tag stamped into trace metadata |
 
----
+### Running on Cloudera AI
 
-## Run on Cloudera AI
-
-1. **Create a project** from this repo. Provision the Nemotron LLM endpoint if you don't already have one, and run **Steps 1–3** from *How to run this demo end-to-end* above to seed the DB, train the model, and deploy the `nba-risk-endpoint` classifier. Note both endpoints' base URLs + tokens.
+1. **Create a project** from this repo. Provision the Nemotron LLM endpoint if you don't already have one; if you want the ML guardrail path, also run **Steps 2–3** from the Quickstart to train and deploy the `nba-risk-endpoint` classifier. Note both endpoints' base URLs + tokens.
 2. **Set env vars** on the Application (or in a session's project env vars) — everything from the table above.
 3. **Launch as an Application** pointing at `launch_app.py`. On boot it will:
    - run `python /home/cdsw/app/pii_datagen.py --ensure` to create `nba_demo.db` at the project root and seed offers + customers (idempotent — no-op on restart);
    - then `streamlit run /home/cdsw/app/nba_app.py --server.port $CDSW_READONLY_PORT --server.address 127.0.0.1`.
 4. **Open the app URL** and chat.
 
----
+## Hardware Requirements
 
-## Offline evaluation
+| Deployment | Minimum |
+|---|---|
+| Launchable / demo (rules-based guardrail) | 2 vCPU, 8 GB RAM, 5 GB storage for the CAI Application + workbench session. All LLM inference happens on the remote CAI Inference endpoint. |
+| ML guardrail path (add XGBoost or PyTorch training + endpoint) | Additional 2 vCPU, 8 GB RAM for the training notebook; CAI Inference endpoint for the ONNX classifier (a single small CPU instance is sufficient). |
+| Production / enterprise | Size the CAI Application per expected concurrent chat sessions (each session holds one LangGraph checkpointer thread in memory). LLM and classifier endpoints scale independently on CAI Inference. |
+
+The Nemotron LLM endpoint's sizing is orthogonal and depends entirely on your CAI Inference deployment (typically GPU-backed).
+
+## Documentation
+
+### Offline evaluation — details
 
 Three notebooks, run in order:
 
@@ -252,11 +340,7 @@ Three notebooks, run in order:
    - `nba-risk-split` — decline path only
    - `nba-student-split` — student split only
 
-Acceptance targets at temperature 0.2: `correct_offer >= 0.7`, `guardrail_correct == 1.0`, `offer_relevance >= 7/10`.
-
----
-
-## Online monitoring
+### Online monitoring — details
 
 Inside the running Streamlit app:
 
@@ -267,30 +351,7 @@ Inside the running Streamlit app:
 
 Alert patterns to configure in LangSmith: drop in `offer_relevance` mean, spike in `guardrail_correct == 0` false positives, or a spike in 👎 feedback.
 
----
-
-## Files
-
-| File | Role |
-|---|---|
-| `app/nba_app.py` | LangGraph chatbot + Streamlit UI. Hosts `_rules_based_risk_score`, the current placeholder guardrail. |
-| `app/db.py` | SQLite schema + offer seeding (DB file `nba_demo.db` sits at the project root so both the app and the notebooks can reach it) |
-| `app/offer_rules.py` | Rule-engine (SQL filter + Python re-scoring) |
-| `app/pii_datagen.py` | Faker-based customer seeder (`--ensure`, `--rows`) |
-| `launch_app.py` | Cloudera AI Application entry point (stays at repo root so CAI's Application `Script` field is `launch_app.py`) |
-| `xgboost/01_train_xgboost_onnx.ipynb` | **Optional (ML guardrail path).** Trains the customer-risk XGBoost classifier off SQLite and registers it as `nba-risk-onnx-xgboost` |
-| `xgboost/02_deploy_xgboost_ai_inf.ipynb` | **Optional (ML guardrail path).** Deploys the registered model to the `nba-risk-endpoint` CAI Inference endpoint + smoke-tests it |
-| `pytorch_train/01_train_pytorch_onnx.ipynb` | **Optional (ML guardrail path).** Alternative to XGBoost — trains an 8-feature PyTorch NN off the same SQLite data, exports to ONNX, and registers as `nba-risk-onnx-pytorch` (+ raw PyTorch model as `nba-risk-pytorch`) |
-| `pytorch_train/02_deploy_pytorch_ai_inf.ipynb` | **Optional (ML guardrail path).** Deploys `nba-risk-onnx-pytorch` to the `nba-risk-pytorch-endpoint` CAI Inference endpoint + smoke-tests it |
-| `nba_dataset_upload.ipynb` | Uploads scripted multi-turn examples |
-| `nba_evaluators.ipynb` | 4 evaluators (2 deterministic, 2 LLM-as-judge) |
-| `nba_experiments.ipynb` | `evaluate()` calls with replay target |
-| `.env.example` | Env-var template |
-| `utils.py`, `tracing_basics.ipynb`, `dataset_upload.ipynb`, `evaluators.ipynb`, `experiments.ipynb`, `types_of_runs.ipynb`, `conversational_threads.ipynb` | Reference material from the LangSmith course, unmodified |
-
----
-
-## Extending
+### Extending
 
 - **Add a new offer.** Edit `_OFFERS` in `app/db.py`, re-run `python app/pii_datagen.py --ensure`. Rule engine picks it up automatically.
 - **Add a new evaluator.** Drop a `def my_eval(inputs, outputs, reference_outputs) -> {"key":..., "score":..., "comment":...}` into `nba_evaluators.ipynb` and add it to the `EVALUATORS` list in `nba_experiments.ipynb`.
@@ -306,11 +367,17 @@ The rules-based `_rules_based_risk_score` in `app/nba_app.py` is a placeholder. 
 3. In `risk_guardrail_node`, replace the `_rules_based_risk_score(customer)` call with an inference call to the endpoint. The historical XGBoost inference function (`_xgboost_infer`) lives in the git history — restoring it plus re-adding the `httpx` / `open_inference` imports and rebuilding the feature vector from `FEATURE_ORDER` (still defined in `app/nba_app.py`) is enough to switch back.
 4. The output contract (`high_risk_probability`, `risk_blocked`) is unchanged, so nothing downstream needs updating.
 
-## Blueprint Enhancements
+### Blueprint enhancement ideas
 
-- Replace sqllite customer info table for xgboost model training with Hive customer table 
-- Replace sqllite customer info table for in-interaction lookups with OpDB customer / PII table
-- Enrich customer info schema from simple table to customer database for more complex PII-based reasoning
-- Deploy app in Inference Service rather than Workbench
-- Augment reasoning capabilities with dynamic pricing or advanced price modeling capabilities to be consumed by MAS
-- Automate deployment via AMP mechanism
+- Replace SQLite customer info table for XGBoost model training with a **Hive** customer table.
+- Replace SQLite customer info table for in-interaction lookups with **OpDB** customer / PII table.
+- Enrich customer info schema from simple table to a customer database for more complex PII-based reasoning.
+- Deploy the app on **Cloudera AI Inference Service** rather than the workbench.
+- Augment reasoning capabilities with dynamic pricing or advanced price-modeling capabilities consumed by the MAS.
+- Automate deployment via the **AMP** mechanism.
+
+### External documentation
+
+- [Cloudera AI Inference Service documentation](https://docs.cloudera.com/machine-learning/cloud/ai-inference/index.html)
+- [LangGraph documentation](https://langchain-ai.github.io/langgraph/)
+- [LangSmith documentation](https://docs.smith.langchain.com/)
