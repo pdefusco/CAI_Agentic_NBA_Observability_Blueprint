@@ -95,11 +95,18 @@ def get_llm(temperature: float = 0.2) -> ChatOpenAI:
     """
     global _llm
     if _llm is None:
+        # ``timeout`` and ``max_retries`` matter: Nemotron on CAI Inference
+        # accepts our request but returns an empty ``tool_calls`` list when
+        # the OpenAI function-calling schema is sent, so downstream
+        # ``with_structured_output`` calls use ``method="json_mode"`` (see
+        # call sites) and we bound how long any single HTTP call can wait.
         _llm = ChatOpenAI(
             model=LLM_MODEL_ID,
             base_url=LLM_ENDPOINT_BASE_URL or None,
             api_key=LLM_CDP_TOKEN or "unused",
             temperature=temperature,
+            timeout=60,
+            max_retries=1,
         )
     return _llm
 
@@ -156,9 +163,8 @@ feature_prompt = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            """You are a feature-extraction engine.
-
-Extract these fields from the user's latest message:
+            """You are a feature-extraction engine.  Respond with a single
+JSON object with the following keys:
 - age (int)
 - annual_income (float)
 - requested_credit_line (float)
@@ -168,9 +174,10 @@ Extract these fields from the user's latest message:
 - stated_goal (short free-text summary of what the customer wants)
 
 Rules:
-- If a value is not stated, return 0 (or "UNKNOWN" for employment_status, "" for stated_goal).
+- If a value is not stated, use 0 (or "UNKNOWN" for employment_status, "" for stated_goal).
 - Do NOT infer values that were not explicitly stated.
-- Only return numeric values for numeric fields.
+- Only use numeric values for numeric fields.
+- Return ONLY the JSON object, nothing else.
 """,
         ),
         ("human", "{input}"),
@@ -184,9 +191,11 @@ intent_prompt = ChatPromptTemplate.from_messages(
             """You are the intent router for a credit-card recommendation chatbot.
 
 Classify the conversation state given the full message history and the
-features already gathered.
+features already gathered.  Respond with a single JSON object with keys:
+- stage: one of "NEED_MORE_INFO", "READY_FOR_OFFER", "POST_OFFER_CHAT"
+- reasoning: one short sentence explaining the choice
 
-Return one of:
+Stage semantics:
 - NEED_MORE_INFO   — we don't yet know enough about the customer's goal,
                      income, or debt situation to make a specific recommendation.
 - READY_FOR_OFFER  — the customer has stated a clear goal AND we have at
@@ -199,6 +208,8 @@ Return one of:
 Be conservative: prefer NEED_MORE_INFO if the goal is vague.  Prefer
 POST_OFFER_CHAT whenever an offer has already been presented, even for
 questions that could arguably reset the flow.
+
+Return ONLY the JSON object, nothing else.
 """,
         ),
         (
@@ -461,7 +472,9 @@ def intake_node(state: GraphState) -> Dict[str, Any]:
             stated_goal=latest_user[:80],
         )
     else:
-        features_chain = feature_prompt | get_llm().with_structured_output(Features)
+        features_chain = feature_prompt | get_llm().with_structured_output(
+            Features, method="json_mode"
+        )
         extracted = features_chain.invoke({"input": latest_user})
 
     new_features = extracted.dict() if hasattr(extracted, "dict") else dict(extracted)
@@ -536,7 +549,9 @@ def intent_router_node(state: GraphState) -> Dict[str, Any]:
         else:
             stage = "NEED_MORE_INFO"
     else:
-        chain = intent_prompt | get_llm().with_structured_output(Intent)
+        chain = intent_prompt | get_llm().with_structured_output(
+            Intent, method="json_mode"
+        )
         decision = chain.invoke(
             {
                 "transcript": transcript,
