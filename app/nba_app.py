@@ -945,9 +945,11 @@ def get_graph():
         return _graph_singleton
 
 
-# Backwards-compat alias for code that imports ``graph`` directly.  This
-# resolves to the cached singleton the first time it is read.
-graph = get_graph()
+# NOTE: no eager ``graph = get_graph()`` at module top level — calling into
+# Streamlit's cache machinery before ``run_streamlit_app`` invokes
+# ``st.set_page_config`` makes Streamlit think a widget/command has already
+# fired, which breaks set_page_config's "must be first command" check.  All
+# callers go through ``get_graph()`` lazily.
 
 
 # ----------------------------------------------------------------------

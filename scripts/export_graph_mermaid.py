@@ -33,7 +33,7 @@ import nba_app  # noqa: E402  (import after sys.path tweak)
 OUT_PATH = REPO_ROOT / "img" / "nba_graph.mmd"
 OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-mermaid_src = nba_app.graph.get_graph().draw_mermaid()
+mermaid_src = nba_app.get_graph().get_graph().draw_mermaid()
 OUT_PATH.write_text(mermaid_src)
 print(f"wrote {OUT_PATH.relative_to(REPO_ROOT)}  ({len(mermaid_src):,} chars)\n")
 print("---")
