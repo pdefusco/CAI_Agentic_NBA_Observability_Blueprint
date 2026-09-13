@@ -167,7 +167,7 @@ Copy `.env.example` to `.env` and fill in:
 
 Three notebooks, run in order:
 
-1. **`nba_dataset_upload.ipynb`** — creates dataset `NBA Golden Dataset` in LangSmith with ~14 scripted multi-turn conversations, each labeled with a `split` (`travel`, `balance-transfer`, `secured`, `student`, `cashback`, `fraud-decline`).
+1. **`nba_dataset_upload.ipynb`** — creates dataset `NBA Golden Dataset` in LangSmith with ~14 scripted multi-turn conversations, each labeled with a `split` (`travel`, `balance-transfer`, `secured`, `student`, `cashback`, `risk-decline`).
 2. **`nba_evaluators.ipynb`** — defines 4 evaluators:
    - `correct_offer_selection` (deterministic — matches `expected_offer_id`)
    - `guardrail_correctness` (deterministic — did the risk guardrail fire iff expected)
@@ -176,7 +176,7 @@ Three notebooks, run in order:
 3. **`nba_experiments.ipynb`** — the target function **replays each scripted conversation turn-by-turn** against the compiled graph (fresh `thread_id` per example, one `run_turn` per user turn), then LangSmith's `evaluate()` grades the final state. Runs several experiments side-by-side:
    - `nba-baseline-t0.2` — reference metrics at temperature 0.2
    - `nba-hi-temp-0.7` — temperature 0.7 with `num_repetitions=3` for stability
-   - `nba-fraud-split` — decline path only
+   - `nba-risk-split` — decline path only
    - `nba-student-split` — student split only
 
 Acceptance targets at temperature 0.2: `correct_offer >= 0.7`, `guardrail_correct == 1.0`, `offer_relevance >= 7/10`.
