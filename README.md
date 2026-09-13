@@ -132,28 +132,6 @@ Copy `.env.example` to `.env` and fill in:
 
 ---
 
-## Run locally (no Cloudera)
-
-```bash
-pip install -r requirements.txt
-cp .env.example .env    # fill in — or leave blank and set NBA_MOCK=1
-
-# Seed a small DB for smoke-testing
-python pii_datagen.py --rows 200 --ensure
-
-# Boot the chatbot (mock mode skips LLM + XGBoost calls)
-NBA_MOCK=1 streamlit run nba_app.py
-```
-
-Try the following turns to exercise all paths:
-
-- **Travel path** → "Hi, I want to upgrade my card." → "I travel a lot for work, income around $180K."
-- **Follow-up** → "What's the annual fee?" (routes to `post_offer_chat`)
-- **Risk decline path** → pick a `customer_id` in the sidebar whose `customers.risk_tier` row is `HIGH` — `risk_guardrail_node` short-circuits into the decline branch.
-- **New thread** → click "New conversation" in the sidebar.
-
----
-
 ## Offline evaluation
 
 Three notebooks, run in order:
