@@ -49,7 +49,7 @@ With `LANGSMITH_API_KEY`, `LANGSMITH_PROJECT`, and the LLM/XGBoost endpoint env 
 
 ### Step 4 — Deploy the chatbot and try it live
 
-Launch the Streamlit app as a Cloudera AI Application pointing at **`launch_app.py`** (or run `streamlit run nba_app.py` locally). Open the app URL and try:
+Launch the Streamlit app as a Cloudera AI Application pointing at **`launch_app.py`** (or run `streamlit run app/nba_app.py` locally). Open the app URL and try:
 
 - **Card upgrade** → *"Hi, I'd like to upgrade my credit card."* → follow the clarifying prompts (income, goal). The bot will pitch the best-fit offer from the rule engine.
 - **Post-offer follow-up** → *"What's the annual fee?"* — routes to `post_offer_chat` using the offer already in state.
@@ -126,8 +126,8 @@ Copy `.env.example` to `.env` and fill in:
 1. **Create a project** from this repo. Provision the Nemotron LLM endpoint if you don't already have one, and run **Steps 1–2** from *How to run this demo end-to-end* above to train and deploy the `nba-risk-endpoint` classifier. Note both endpoints' base URLs + tokens.
 2. **Set env vars** on the Application (or in a session's project env vars) — everything from the table above.
 3. **Launch as an Application** pointing at `launch_app.py`. On boot it will:
-   - run `python /home/cdsw/pii_datagen.py --ensure` to create `nba_demo.db` and seed offers + customers (idempotent — no-op on restart);
-   - then `streamlit run /home/cdsw/nba_app.py --server.port $CDSW_READONLY_PORT --server.address 127.0.0.1`.
+   - run `python /home/cdsw/app/pii_datagen.py --ensure` to create `nba_demo.db` at the project root and seed offers + customers (idempotent — no-op on restart);
+   - then `streamlit run /home/cdsw/app/nba_app.py --server.port $CDSW_READONLY_PORT --server.address 127.0.0.1`.
 4. **Open the app URL** and chat.
 
 ---
@@ -169,11 +169,11 @@ Alert patterns to configure in LangSmith: drop in `offer_relevance` mean, spike 
 
 | File | Role |
 |---|---|
-| `nba_app.py` | LangGraph chatbot + Streamlit UI |
-| `db.py` | SQLite schema + offer seeding |
-| `offer_rules.py` | Rule-engine (SQL filter + Python re-scoring) |
-| `pii_datagen.py` | Faker-based customer seeder (`--ensure`, `--rows`) |
-| `launch_app.py` | Cloudera AI Application entry point |
+| `app/nba_app.py` | LangGraph chatbot + Streamlit UI |
+| `app/db.py` | SQLite schema + offer seeding (DB file `nba_demo.db` sits at the project root so both the app and the notebooks can reach it) |
+| `app/offer_rules.py` | Rule-engine (SQL filter + Python re-scoring) |
+| `app/pii_datagen.py` | Faker-based customer seeder (`--ensure`, `--rows`) |
+| `launch_app.py` | Cloudera AI Application entry point (stays at repo root so CAI's Application `Script` field is `launch_app.py`) |
 | `xgboost/01_train_xgboost_onnx.ipynb` | Trains the customer-risk XGBoost classifier off SQLite and registers it as `nba-risk-onnx-xgboost` |
 | `xgboost/02_deploy_xgboost_ai_inf.ipynb` | Deploys the registered model to the `nba-risk-endpoint` CAI Inference endpoint + smoke-tests it |
 | `nba_dataset_upload.ipynb` | Uploads scripted multi-turn examples |
@@ -186,7 +186,7 @@ Alert patterns to configure in LangSmith: drop in `offer_relevance` mean, spike 
 
 ## Extending
 
-- **Add a new offer.** Edit `OFFERS` in `db.py`, re-run `python pii_datagen.py --ensure`. Rule engine picks it up automatically.
+- **Add a new offer.** Edit `_OFFERS` in `app/db.py`, re-run `python app/pii_datagen.py --ensure`. Rule engine picks it up automatically.
 - **Add a new evaluator.** Drop a `def my_eval(inputs, outputs, reference_outputs) -> {"key":..., "score":..., "comment":...}` into `nba_evaluators.ipynb` and add it to the `EVALUATORS` list in `nba_experiments.ipynb`.
 - **Swap the LLM.** Change `LLM_MODEL_ID` + `LLM_ENDPOINT_BASE_URL` — everything is OpenAI-compatible through `langchain-openai`.
-- **Persistent thread state across app restarts.** Swap `MemorySaver` for `SqliteSaver('nba_demo.db')` in `nba_app.py:_build_graph`.
+- **Persistent thread state across app restarts.** Swap `MemorySaver` for `SqliteSaver('nba_demo.db')` in `app/nba_app.py:_build_graph`.

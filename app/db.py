@@ -31,9 +31,14 @@ import sqlite3
 from typing import Optional
 
 
+# The SQLite file lives at the project root (``/home/cdsw/nba_demo.db`` on
+# Cloudera AI) so both the app code under ``app/`` and the eval / training
+# notebooks at the repo root read from the same store.  Override with
+# ``NBA_DB_PATH`` if you need a different location.
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.environ.get(
     "NBA_DB_PATH",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "nba_demo.db"),
+    os.path.join(_PROJECT_ROOT, "nba_demo.db"),
 )
 
 
