@@ -369,6 +369,10 @@ class GraphState(TypedDict, total=False):
     # Transient hop from intent_router -> stage_router. Must be declared on
     # the TypedDict or LangGraph drops it as an unknown key when persisting.
     _next_stage: Optional[str]
+    # Clarify-cap telemetry — how many clarifying questions have been asked
+    # so far (surfaced to the LangSmith node output and the Streamlit debug
+    # panel so the cap is visible without opening the transcript).
+    clarify_count: Optional[int]
 
 
 # ----------------------------------------------------------------------
@@ -653,23 +657,38 @@ def intent_router_node(state: GraphState) -> Dict[str, Any]:
 
     # Hard cap: if we've already asked MAX_CLARIFY_TURNS clarifying questions
     # and no offer has been presented yet, force the graph to commit to an
-    # offer.  The rule engine can always pick *something* from the offers
-    # table given the customer_record + partial features, so we'd rather
-    # present a best-guess offer than loop forever.
+    # offer regardless of what the LLM router said.  The rule engine can
+    # always pick *something* from the offers table given the customer_record
+    # + partial features, so we'd rather present a best-guess offer than loop
+    # forever.  Deliberately unconditional on ``stage`` so a mis-typed LLM
+    # response can't slip past the cap.
     clarify_count = _count_clarify_turns(state.get("messages", []))
-    if (
-        not offer_presented
-        and stage == "NEED_MORE_INFO"
-        and clarify_count >= MAX_CLARIFY_TURNS
-    ):
+    cap_hit = (not offer_presented) and (clarify_count >= MAX_CLARIFY_TURNS)
+    if cap_hit:
         stage = "READY_FOR_OFFER"
+        print(
+            f"[intent_router] clarify cap hit: clarify_count={clarify_count} "
+            f"MAX_CLARIFY_TURNS={MAX_CLARIFY_TURNS} → forcing READY_FOR_OFFER",
+            flush=True,
+        )
+        rt = get_current_run_tree()
+        if rt is not None:
+            try:
+                rt.add_tags(["clarify_cap_hit"])
+            except Exception:
+                pass
 
     stage_map = {
         "NEED_MORE_INFO": "gathering",
         "READY_FOR_OFFER": "offer_presented",  # will be set for real by presentation node
         "POST_OFFER_CHAT": "post_offer",
     }
-    return {"_next_stage": stage, "conversation_stage": stage_map[stage]}
+    return {
+        "_next_stage": stage,
+        "conversation_stage": stage_map[stage],
+        # Surface the cap counter so it shows up in the LangSmith node output.
+        "clarify_count": clarify_count,
+    }
 
 
 def stage_router(state: GraphState) -> Literal["clarify", "select_offer", "post_offer_chat"]:
@@ -1038,6 +1057,11 @@ def run_streamlit_app() -> None:
                 f"{last.get('high_risk_probability'):.2%}"
                 if last.get("high_risk_probability") is not None
                 else "n/a",
+            )
+            st.write(
+                f"Clarify turns: "
+                f"{last.get('clarify_count', 0)} / {MAX_CLARIFY_TURNS} "
+                "(cap forces offer)"
             )
             if last.get("selected_offer"):
                 st.write("Selected offer:", last["selected_offer"]["offer_id"])
