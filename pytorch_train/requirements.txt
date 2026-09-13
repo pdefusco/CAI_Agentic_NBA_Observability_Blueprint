@@ -8,6 +8,6 @@ torch>=2.2.0
 onnx>=1.16.0
 onnxruntime==1.21.0
 onnxscript>=0.1.0
-mlflow>=2.14.0
-matplotlib>=3.8.0
-seaborn==0.13.2
+# NOTE: mlflow is intentionally NOT listed — the Cloudera AI runtime ships a
+# compatible client that talks to the CAI tracking server.  Installing a newer
+# client into ~/.local shadows it and can break run creation.
