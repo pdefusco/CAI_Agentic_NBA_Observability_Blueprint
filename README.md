@@ -1,15 +1,17 @@
 # NBA Chatbot — a Cloudera AI blueprint for evaluated, observed multi-agent apps with LangSmith
 
-A reusable blueprint for building a **Next-Best-Action** credit-card recommender as a **multi-turn chatbot** on **Cloudera AI**, powered by a **LangGraph** multi-agent workflow, risk-guardrailed by an **XGBoost** customer-risk classifier, and fully instrumented with **LangSmith** for offline evaluation and online monitoring.
+A reusable blueprint for building a **Next-Best-Action** credit-card recommender as a **multi-turn chatbot** on **Cloudera AI**, powered by a **LangGraph** multi-agent workflow, guarded by a customer-risk check, and fully instrumented with **LangSmith** for offline evaluation and online monitoring.
 
 The demo user plays a bank customer: they open a chat, state their reason for contacting, and the bot asks clarifying questions until it has enough context to present the best-fit offer conversationally. The user can then keep chatting to ask follow-ups about the offer.
+
+> **Guardrail status.** The customer-risk guardrail currently runs as a small **rules-based placeholder** in `app/nba_app.py` (`_rules_based_risk_score`) — no model endpoint required. An ML-backed guardrail (XGBoost / PyTorch → ONNX → CAI Inference Service) is scaffolded under `xgboost/` and `pytorch_train/` and can be re-enabled by swapping the call in `risk_guardrail_node`. Steps 2–3 below describe the ML path and are optional while the rules-based guardrail is in use.
 
 ---
 
 ## What this demo does
 
 1. **Multi-turn conversation.** LangGraph state is checkpointed per `thread_id`; each turn re-enters the graph at `intake` and either asks a clarifying question, presents an offer, or answers a follow-up.
-2. **Customer-risk guardrail.** The XGBoost classifier on CAI Inference Service is called once per thread as an upstream check; high-risk probability blocks the workflow with a polite decline. Features are read from the customer's PII record (age, annual_income, existing_debt, one-hot employment_status) — no LLM extraction of transaction fields.
+2. **Customer-risk guardrail.** A rules-based check runs once per thread against `state["customer_record"]` (age, annual_income, existing_debt, employment_status, risk_tier). If any rule fires — `risk_tier == HIGH`, debt-to-income > 0.6, or unemployed with material existing debt — the workflow short-circuits into a polite decline. The ML-backed variant (see `xgboost/` and `pytorch_train/`) is a drop-in replacement when you're ready.
 3. **Rule-engine of 5 offers** stored in local SQLite (`nba_demo.db`). SQL filter + Python re-scoring picks the top-K offer for the customer's stated needs + PII record.
 4. **Offline evaluation** in three notebooks (`nba_dataset_upload → nba_evaluators → nba_experiments`) that upload scripted multi-turn conversations, define deterministic + LLM-as-judge evaluators, and run comparable experiments.
 5. **Online monitoring** via `@traceable` and per-turn `thread_id` metadata — every turn is one traced graph invocation, and LangSmith's **Threads** tab groups them into a single conversation. 👍/👎 feedback under each assistant reply lands on the correct turn's `run_id`.
@@ -35,16 +37,22 @@ This creates `nba_demo.db` at the project root and populates it with:
 
 The command is idempotent: `--ensure` skips re-seeding if the table already has enough rows. All downstream steps (training, deployment smoke test, the app itself) read from this same SQLite file.
 
-### Step 2 — Train the XGBoost customer-risk classifier
+### Step 2 — (Optional) Train an ML-backed customer-risk classifier
 
-Open **`xgboost/01_train_xgboost_onnx.ipynb`** in a CAI workbench session and run all cells. This will:
+**Skip this if you're happy with the rules-based guardrail.** The app runs end-to-end without a trained model.
+
+If you want to enable the ML path, open **`xgboost/01_train_xgboost_onnx.ipynb`** in a CAI workbench session and run all cells. This will:
 
 - re-verify `nba_demo.db` is seeded (a no-op if Step 1 ran successfully);
 - train a binary XGBoost classifier on 8 customer-profile features (`age`, `annual_income`, `existing_debt`, plus one-hot `emp_*` employment status) with label `is_high_risk = (risk_tier == 'HIGH')`;
 - log the run to an MLflow experiment named `nba-customer-risk-<PROJECT_OWNER>`;
 - register the ONNX model in the **CAI AI Registry** as **`nba-risk-onnx-xgboost`**.
 
-### Step 3 — Deploy the classifier to CAI Inference Service
+> **Alternative — PyTorch classifier.** If the XGBoost/ONNX conversion path is broken in your CAI environment, `pytorch_train/01_train_pytorch_onnx.ipynb` + `pytorch_train/02_deploy_pytorch_ai_inf.ipynb` train and deploy the equivalent 8-feature customer-risk model as a small PyTorch net exported to ONNX. It registers as `nba-risk-onnx-pytorch` and serves the same `(label, probabilities)` response shape as the XGBoost endpoint.
+
+### Step 3 — (Optional) Deploy the classifier to CAI Inference Service
+
+**Skip if you skipped Step 2.**
 
 Open **`xgboost/02_deploy_xgboost_ai_inf.ipynb`** and run all cells. This will:
 
@@ -52,9 +60,7 @@ Open **`xgboost/02_deploy_xgboost_ai_inf.ipynb`** and run all cells. This will:
 - create (or update) a CAI Inference endpoint named **`nba-risk-endpoint`**;
 - run a smoke-test inference call against the deployed endpoint using rows sampled from the SQLite `customers` table.
 
-Note the endpoint's base URL and CDP token — you'll need them for `CLF_ENDPOINT_BASE_URL` and `CLF_CDP_TOKEN` in the next step.
-
-> **Alternative — PyTorch classifier.** If the XGBoost/ONNX conversion path is broken in your CAI environment, `pytorch_train/01_train_pytorch_onnx.ipynb` + `pytorch_train/02_deploy_pytorch_ai_inf.ipynb` train and deploy the equivalent 8-feature customer-risk model as a small PyTorch net exported to ONNX. It registers as `nba-risk-onnx-pytorch` and serves the same `(label, probabilities)` response shape as the XGBoost endpoint, so pointing `CLF_MODEL_ID` at it requires no code changes in the app.
+Note the endpoint's base URL and CDP token — you'll need them for `CLF_ENDPOINT_BASE_URL` and `CLF_CDP_TOKEN` if/when you wire the ML guardrail back into `app/nba_app.py`. See **Re-enabling the ML guardrail** below.
 
 ### Step 4 — Run the offline LangSmith evaluations
 
@@ -100,9 +106,17 @@ Open your LangSmith project and:
                                    └──(high)──► decline ──► END
                                           │
                                           ▼
+                                   ┌────────────────────────┐
+                                   │  Rules-based risk      │  (risk_tier, DTI,
+                                   │  scorer (in-process)   │   unemployment checks)
+                                   └────────────────────────┘
+                                          │
+                                          │  (swap in for ML path — see
+                                          │   "Re-enabling the ML guardrail")
+                                          ▼
                                    ┌──────────────────┐
-                                   │  CAI XGBoost     │  (high-risk probability)
-                                   │  endpoint        │
+                                   │  CAI XGBoost /   │  (high-risk probability)
+                                   │  PyTorch endpoint│
                                    └──────────────────┘
 
    State (LangGraph MemorySaver, keyed on thread_id):
@@ -123,10 +137,10 @@ Copy `.env.example` to `.env` and fill in:
 | `LLM_MODEL_ID` | Nemotron model ID on CAI Inference (default `nemotron`) |
 | `LLM_ENDPOINT_BASE_URL` | Nemotron OpenAI-compatible base URL (`.../openai/v1`) |
 | `LLM_CDP_TOKEN` | CDP token for the LLM endpoint |
-| `CLF_MODEL_ID` | XGBoost model ID (default `nba-risk-onnx-xgboost`) |
-| `CLF_ENDPOINT_BASE_URL` | XGBoost KServe endpoint (no `/openai/v1` suffix) |
-| `CLF_CDP_TOKEN` | CDP token for the XGBoost endpoint |
-| `HIGH_RISK_THRESHOLD` | Decision threshold for the customer-risk guardrail (default `0.5`). `FRAUD_THRESHOLD` is still accepted as a backwards-compat alias. |
+| `CLF_MODEL_ID` | Unused while the rules-based guardrail is in place. Reserved for when the ML guardrail is re-enabled (default `nba-risk-onnx-xgboost`). |
+| `CLF_ENDPOINT_BASE_URL` | Unused while the rules-based guardrail is in place. XGBoost/PyTorch KServe endpoint (no `/openai/v1` suffix) when re-enabled. |
+| `CLF_CDP_TOKEN` | Unused while the rules-based guardrail is in place. CDP token for the classifier endpoint when re-enabled. |
+| `HIGH_RISK_THRESHOLD` | Decision threshold for the customer-risk guardrail (default `0.5`). Applied to both the rules-based score and any future ML score. `FRAUD_THRESHOLD` is still accepted as a backwards-compat alias. |
 | `NBA_DB_PATH` | SQLite file (default: `nba_demo.db` at the project root) |
 | `NBA_CUSTOMER_ROWS` | Number of synthetic customers to seed (default `10000`) |
 | `NBA_MOCK` | Set to `1` for a local run without live CAI endpoints |
@@ -186,15 +200,15 @@ Alert patterns to configure in LangSmith: drop in `offer_relevance` mean, spike 
 
 | File | Role |
 |---|---|
-| `app/nba_app.py` | LangGraph chatbot + Streamlit UI |
+| `app/nba_app.py` | LangGraph chatbot + Streamlit UI. Hosts `_rules_based_risk_score`, the current placeholder guardrail. |
 | `app/db.py` | SQLite schema + offer seeding (DB file `nba_demo.db` sits at the project root so both the app and the notebooks can reach it) |
 | `app/offer_rules.py` | Rule-engine (SQL filter + Python re-scoring) |
 | `app/pii_datagen.py` | Faker-based customer seeder (`--ensure`, `--rows`) |
 | `launch_app.py` | Cloudera AI Application entry point (stays at repo root so CAI's Application `Script` field is `launch_app.py`) |
-| `xgboost/01_train_xgboost_onnx.ipynb` | Trains the customer-risk XGBoost classifier off SQLite and registers it as `nba-risk-onnx-xgboost` |
-| `xgboost/02_deploy_xgboost_ai_inf.ipynb` | Deploys the registered model to the `nba-risk-endpoint` CAI Inference endpoint + smoke-tests it |
-| `pytorch_train/01_train_pytorch_onnx.ipynb` | Alternative — trains an 8-feature PyTorch NN off the same SQLite data, exports to ONNX, and registers as `nba-risk-onnx-pytorch` (+ raw PyTorch model as `nba-risk-pytorch`) |
-| `pytorch_train/02_deploy_pytorch_ai_inf.ipynb` | Deploys `nba-risk-onnx-pytorch` to the `nba-risk-pytorch-endpoint` CAI Inference endpoint + smoke-tests it |
+| `xgboost/01_train_xgboost_onnx.ipynb` | **Optional (ML guardrail path).** Trains the customer-risk XGBoost classifier off SQLite and registers it as `nba-risk-onnx-xgboost` |
+| `xgboost/02_deploy_xgboost_ai_inf.ipynb` | **Optional (ML guardrail path).** Deploys the registered model to the `nba-risk-endpoint` CAI Inference endpoint + smoke-tests it |
+| `pytorch_train/01_train_pytorch_onnx.ipynb` | **Optional (ML guardrail path).** Alternative to XGBoost — trains an 8-feature PyTorch NN off the same SQLite data, exports to ONNX, and registers as `nba-risk-onnx-pytorch` (+ raw PyTorch model as `nba-risk-pytorch`) |
+| `pytorch_train/02_deploy_pytorch_ai_inf.ipynb` | **Optional (ML guardrail path).** Deploys `nba-risk-onnx-pytorch` to the `nba-risk-pytorch-endpoint` CAI Inference endpoint + smoke-tests it |
 | `nba_dataset_upload.ipynb` | Uploads scripted multi-turn examples |
 | `nba_evaluators.ipynb` | 4 evaluators (2 deterministic, 2 LLM-as-judge) |
 | `nba_experiments.ipynb` | `evaluate()` calls with replay target |
@@ -209,6 +223,15 @@ Alert patterns to configure in LangSmith: drop in `offer_relevance` mean, spike 
 - **Add a new evaluator.** Drop a `def my_eval(inputs, outputs, reference_outputs) -> {"key":..., "score":..., "comment":...}` into `nba_evaluators.ipynb` and add it to the `EVALUATORS` list in `nba_experiments.ipynb`.
 - **Swap the LLM.** Change `LLM_MODEL_ID` + `LLM_ENDPOINT_BASE_URL` — everything is OpenAI-compatible through `langchain-openai`.
 - **Persistent thread state across app restarts.** Swap `MemorySaver` for `SqliteSaver('nba_demo.db')` in `app/nba_app.py:_build_graph`.
+
+### Re-enabling the ML guardrail
+
+The rules-based `_rules_based_risk_score` in `app/nba_app.py` is a placeholder. To swap in the ML-backed guardrail:
+
+1. Run Steps 2 and 3 (XGBoost path) or their PyTorch equivalents to train and deploy an endpoint.
+2. Set `CLF_MODEL_ID`, `CLF_ENDPOINT_BASE_URL`, and `CLF_CDP_TOKEN`.
+3. In `risk_guardrail_node`, replace the `_rules_based_risk_score(customer)` call with an inference call to the endpoint. The historical XGBoost inference function (`_xgboost_infer`) lives in the git history — restoring it plus re-adding the `httpx` / `open_inference` imports and rebuilding the feature vector from `FEATURE_ORDER` (still defined in `app/nba_app.py`) is enough to switch back.
+4. The output contract (`high_risk_probability`, `risk_blocked`) is unchanged, so nothing downstream needs updating.
 
 ## Blueprint Enhancements
 
