@@ -22,4 +22,5 @@ xgboost==2.1.4
 onnxmltools>=1.13.0
 onnxruntime==1.21.0
 
-streamlit==1.30.0
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0

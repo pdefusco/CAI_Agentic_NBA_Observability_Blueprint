@@ -370,8 +370,9 @@ class GraphState(TypedDict, total=False):
     # the TypedDict or LangGraph drops it as an unknown key when persisting.
     _next_stage: Optional[str]
     # Clarify-cap telemetry — how many clarifying questions have been asked
-    # so far (surfaced to the LangSmith node output and the Streamlit debug
-    # panel so the cap is visible without opening the transcript).
+    # so far (surfaced to the LangSmith node output and the web UI's
+    # observability panel so the cap is visible without opening the
+    # transcript).
     clarify_count: Optional[int]
 
 
@@ -446,6 +447,21 @@ def _strip_reasoning(text: str) -> str:
     if idx != -1:
         cleaned = cleaned[idx + len("</think>"):]
     return cleaned.strip()
+
+
+def strip_offer_marker(text: str) -> str:
+    """Hide the ``[OFFER PRESENTED: <offer_id>]`` marker from the customer.
+
+    ``offer_presentation_node`` prefixes its reply with that marker so later
+    turns can detect an offer is already on the table (see
+    ``intent_router_node``).  It belongs in ``state.messages``, not on screen,
+    so the UI renders the text *after* the marker line.  Returns ``text``
+    unchanged when no marker is present, or when stripping would leave
+    nothing behind.
+    """
+    if not text or not text.startswith("[OFFER PRESENTED:"):
+        return text
+    return "\n".join(text.splitlines()[2:]) or text
 
 
 def _merge_features(current: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
@@ -625,7 +641,7 @@ def intent_router_node(state: GraphState) -> Dict[str, Any]:
     """LLM-classified conversation stage router.
 
     Writes ``conversation_stage`` in state so downstream nodes and the
-    Streamlit UI can inspect it.
+    web UI can inspect it.
     """
     transcript = _transcript(state.get("messages", []))
     features = state.get("accumulated_features", {}) or {}
@@ -910,45 +926,32 @@ def _build_graph():
     return builder.compile(checkpointer=MemorySaver())
 
 
-# Compiled graph singleton.  This module is run by `streamlit run nba_app.py`,
-# which re-executes the entire script on every user interaction — if we
-# constructed the graph at module top level naively, each user message would
-# get a brand-new ``MemorySaver`` and no thread state would ever persist.  We
-# therefore keep the compiled graph in Streamlit's cross-rerun cache when
-# Streamlit is available, and fall back to a plain module-level singleton for
-# other callers (evaluators, tests).
+# Compiled graph singleton.  ``MemorySaver`` holds every thread's checkpoint
+# in the graph object itself, so all callers in a process must share one
+# instance — rebuild it per request and no conversation would survive past its
+# first turn.  One uvicorn worker therefore == one graph == one set of live
+# threads; the evaluators and tests that import this module get the same
+# singleton for free.
 _graph_singleton = None
 
 
 def get_graph():
-    """Return the compiled LangGraph, cached across Streamlit reruns.
+    """Return the compiled LangGraph, built once per process.
 
-    ``@st.cache_resource`` scopes to the Streamlit *server process*, which
-    is exactly what we want: the ``MemorySaver`` inside the graph keeps
-    every thread's checkpoint alive as long as the CAI Application process
-    is up.  Restart the app to clear it.
+    The ``MemorySaver`` checkpointer lives inside the compiled graph, so this
+    single module-level singleton is what keeps every thread's conversation
+    state alive for the lifetime of the uvicorn worker.  Restart the app to
+    clear it.
     """
     global _graph_singleton
-    try:
-        import streamlit as st
-
-        @st.cache_resource
-        def _cached_graph():
-            return _build_graph()
-
-        return _cached_graph()
-    except Exception:
-        # No Streamlit context (e.g. imported by an evaluator).  Fall back
-        # to a plain module-level singleton — same process = same graph.
-        if _graph_singleton is None:
-            _graph_singleton = _build_graph()
-        return _graph_singleton
+    if _graph_singleton is None:
+        _graph_singleton = _build_graph()
+    return _graph_singleton
 
 
-# NOTE: no eager ``graph = get_graph()`` at module top level — calling into
-# Streamlit's cache machinery before ``run_streamlit_app`` invokes
-# ``st.set_page_config`` makes Streamlit think a widget/command has already
-# fired, which breaks set_page_config's "must be first command" check.  All
+# NOTE: no eager ``graph = get_graph()`` at module top level — building the
+# graph is deferred so importers that only want the helpers (or that set
+# ``NBA_MOCK`` after import, as the eval notebooks do) don't pay for it.  All
 # callers go through ``get_graph()`` lazily.
 
 
@@ -981,11 +984,9 @@ def run_turn(
     if customer_id is not None:
         input_state["customer_id"] = customer_id
 
-    # Always resolve via ``get_graph()`` so the cached singleton is used
-    # across Streamlit reruns.  Reading the module-level ``graph`` name
-    # would bind to whatever value existed the first time this function
-    # was compiled — which on Streamlit's exec-per-rerun model is usually
-    # a graph from a discarded MemorySaver.
+    # Always resolve via ``get_graph()`` so every turn hits the same compiled
+    # graph — and therefore the same MemorySaver — for the life of the
+    # process.
     final_state = get_graph().invoke(input_state, config=config)
 
     rt = get_current_run_tree()
@@ -1004,7 +1005,7 @@ def run_turn(
         "conversation_stage": final_state.get("conversation_stage"),
         "accumulated_features": final_state.get("accumulated_features", {}),
         "customer_record": final_state.get("customer_record"),
-        # Surfaced so the Streamlit sidebar can confirm the cap counter is
+        # Surfaced so the observability panel can confirm the cap counter is
         # advancing — if this stays at None across turns, the deployed app is
         # running a build older than commit 4968e00.
         "clarify_count": final_state.get("clarify_count"),
@@ -1012,14 +1013,14 @@ def run_turn(
 
 
 # ----------------------------------------------------------------------
-# Streamlit UI
+# Demo customer slate (served to the web UI by app/server.py)
 # ----------------------------------------------------------------------
 
 
-def _demo_customer_picks(per_tier: int = 2) -> List[Dict[str, Any]]:
+def demo_customer_picks(per_tier: int = 2) -> List[Dict[str, Any]]:
     """Return a small deterministic slate of customers spanning every risk tier.
 
-    Streamlit's sidebar uses this to build a dropdown so demo users can hit
+    The web UI builds its customer dropdown from this, so demo users can hit
     the offer path (LOW/MED tiers) or the risk-decline path (HIGH tier) on
     purpose, rather than rolling dice against a random ``customer_id``.
     """
@@ -1045,167 +1046,3 @@ def _demo_customer_picks(per_tier: int = 2) -> List[Dict[str, Any]]:
             picks[tier].append({k: r[k] for k in r.keys()})
     # Order: LOW → MED → HIGH so the dropdown flows from safest to riskiest.
     return [r for tier in ("LOW", "MED", "HIGH") for r in picks[tier]]
-
-
-def run_streamlit_app() -> None:
-    import streamlit as st
-
-    st.set_page_config(page_title="NBA Credit-Card Chatbot", layout="wide")
-    st.title("Next-Best-Action Credit-Card Chatbot")
-
-    # Cache the customer slate so we hit the DB once per Streamlit session
-    # rather than on every rerun.
-    demo_customers = st.cache_data(_demo_customer_picks)()
-
-    # --- Session state ------------------------------------------------
-    if "thread_id" not in st.session_state:
-        st.session_state.thread_id = str(uuid.uuid4())
-    if "history" not in st.session_state:
-        # list of dicts: {"role": ..., "content": ..., "run_id": ...}
-        st.session_state.history = []
-    if "customer_id" not in st.session_state:
-        st.session_state.customer_id = None
-    if "last_result" not in st.session_state:
-        st.session_state.last_result = None
-
-    # --- Sidebar ------------------------------------------------------
-    with st.sidebar:
-        st.header("Session")
-        st.text_input(
-            "thread_id",
-            value=st.session_state.thread_id,
-            key="_thread_id_display",
-            disabled=True,
-        )
-        # Curated dropdown covering every risk tier so the demo can
-        # deterministically exercise both the offer path (LOW/MED) and the
-        # risk-decline path (HIGH).  See ``_demo_customer_picks`` for how
-        # the slate is built.
-        if demo_customers:
-            def _fmt_customer(cid: int) -> str:
-                row = next(r for r in demo_customers if r["customer_id"] == cid)
-                return (
-                    f"#{row['customer_id']} — {row['full_name']} "
-                    f"({row['risk_tier']} risk, ${row['annual_income']:,})"
-                )
-
-            cid_options = [r["customer_id"] for r in demo_customers]
-            default_idx = 0
-            if st.session_state.customer_id in cid_options:
-                default_idx = cid_options.index(st.session_state.customer_id)
-            selected_cid = st.selectbox(
-                "customer_id",
-                cid_options,
-                index=default_idx,
-                format_func=_fmt_customer,
-                help=(
-                    "LOW/MED risk → clarify then present an offer. "
-                    "HIGH risk → the guardrail declines and redirects to support."
-                ),
-            )
-            st.session_state.customer_id = selected_cid
-        else:
-            st.info("Seed the DB (`python app/pii_datagen.py --ensure`) to populate the dropdown.")
-            st.session_state.customer_id = None
-
-        if st.button("New conversation"):
-            st.session_state.thread_id = str(uuid.uuid4())
-            st.session_state.history = []
-            st.session_state.last_result = None
-            st.rerun()
-
-        st.markdown("---")
-        st.caption("LangSmith")
-        if LANGSMITH_ORG:
-            thread_url = (
-                f"https://smith.langchain.com/o/{LANGSMITH_ORG}"
-                f"/projects/p/{LANGSMITH_PROJECT}/t/{st.session_state.thread_id}"
-            )
-            st.markdown(f"[Open thread ↗]({thread_url})")
-        else:
-            st.caption("Set LANGSMITH_ORG to enable one-click thread links.")
-
-        # Debug pane — surface what the router / rule engine is doing.
-        st.markdown("---")
-        st.caption("Debug")
-        last = st.session_state.last_result
-        if last is not None:
-            st.write("Stage:", last.get("conversation_stage"))
-            st.write(
-                "High-risk probability:",
-                f"{last.get('high_risk_probability'):.2%}"
-                if last.get("high_risk_probability") is not None
-                else "n/a",
-            )
-            st.write(
-                f"Clarify turns: "
-                f"{last.get('clarify_count', 0)} / {MAX_CLARIFY_TURNS} "
-                "(cap forces offer)"
-            )
-            if last.get("selected_offer"):
-                st.write("Selected offer:", last["selected_offer"]["offer_id"])
-            with st.expander("Accumulated features"):
-                st.json(last.get("accumulated_features", {}))
-            with st.expander("Candidate offers"):
-                st.json(
-                    [
-                        {"offer_id": o["offer_id"], "offer_name": o["offer_name"]}
-                        for o in (last.get("candidate_offers") or [])
-                    ]
-                )
-
-    # --- Chat history rendering --------------------------------------
-    for i, msg in enumerate(st.session_state.history):
-        with st.chat_message(msg["role"]):
-            content = msg["content"]
-            # Hide the [OFFER PRESENTED: ...] marker line from users; it's
-            # kept in state for the router.
-            if content.startswith("[OFFER PRESENTED:"):
-                content = "\n".join(content.splitlines()[2:]) or content
-            st.markdown(content)
-
-            if msg["role"] == "assistant" and msg.get("run_id"):
-                run_id = msg["run_id"]
-                cols = st.columns([1, 1, 6])
-                if cols[0].button("👍", key=f"up_{run_id}_{i}"):
-                    try:
-                        Client().create_feedback(run_id, key="user_thumbs", score=1)
-                        st.toast("Thanks for the feedback!")
-                    except Exception as exc:  # noqa: BLE001
-                        st.warning(f"LangSmith feedback failed: {exc}")
-                if cols[1].button("👎", key=f"dn_{run_id}_{i}"):
-                    try:
-                        Client().create_feedback(run_id, key="user_thumbs", score=0)
-                        st.toast("Thanks for the feedback!")
-                    except Exception as exc:  # noqa: BLE001
-                        st.warning(f"LangSmith feedback failed: {exc}")
-
-    # --- Input --------------------------------------------------------
-    prompt = st.chat_input("Type your message...")
-    if prompt:
-        st.session_state.history.append({"role": "user", "content": prompt, "run_id": None})
-        with st.chat_message("user"):
-            st.markdown(prompt)
-
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                result = run_turn(
-                    prompt,
-                    st.session_state.thread_id,
-                    st.session_state.customer_id,
-                )
-            content = result["assistant_message"]
-            display = content
-            if display.startswith("[OFFER PRESENTED:"):
-                display = "\n".join(display.splitlines()[2:]) or display
-            st.markdown(display)
-
-        st.session_state.history.append(
-            {"role": "assistant", "content": content, "run_id": result.get("run_id")}
-        )
-        st.session_state.last_result = result
-        st.rerun()
-
-
-if __name__ == "__main__":
-    run_streamlit_app()

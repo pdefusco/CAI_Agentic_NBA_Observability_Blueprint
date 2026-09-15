@@ -19,7 +19,7 @@
 
 ## Overview
 
-This blueprint shows how to build, evaluate, and observe a **production-grade multi-agent chatbot** entirely on Cloudera AI. The demo user plays a bank customer: they open a chat, state their reason for contacting, and a **LangGraph** multi-agent system asks clarifying questions until it has enough context to present the best-fit credit-card offer. A customer-risk guardrail short-circuits the workflow into a polite decline for HIGH-risk profiles. Every turn is traced to **LangSmith** with per-thread grouping and thumbs feedback, and three notebooks turn scripted conversations into repeatable **offline evaluations** with deterministic and LLM-as-judge scorers. The stack — Nemotron on **Cloudera AI Inference Service**, LangGraph checkpointer state, Streamlit UI hosted as a **Cloudera AI Application**, and an optional XGBoost/PyTorch ONNX risk classifier — is the reference wiring for any evaluated agentic app on the Cloudera platform.
+This blueprint shows how to build, evaluate, and observe a **production-grade multi-agent chatbot** entirely on Cloudera AI. The demo user plays a bank customer: they open a chat, state their reason for contacting, and a **LangGraph** multi-agent system asks clarifying questions until it has enough context to present the best-fit credit-card offer. A customer-risk guardrail short-circuits the workflow into a polite decline for HIGH-risk profiles. Every turn is traced to **LangSmith** with per-thread grouping and thumbs feedback, and three notebooks turn scripted conversations into repeatable **offline evaluations** with deterministic and LLM-as-judge scorers. The stack — Nemotron on **Cloudera AI Inference Service**, LangGraph checkpointer state, a TypeScript UI served by **FastAPI** and hosted as a **Cloudera AI Application**, and an optional XGBoost/PyTorch ONNX risk classifier — is the reference wiring for any evaluated agentic app on the Cloudera platform.
 
 **The demo is two things at once.** The chat surface is what a customer sees; the LangSmith surface — traced runs, threaded conversations, per-turn feedback, and offline experiments on a golden dataset — is what a bank's product, risk, and engineering teams see. Both are covered in the [Demo](#demo) section below, and the [LangSmith Observability & Evaluation](#langsmith-observability--evaluation) section walks through how the wiring works end-to-end.
 
@@ -31,9 +31,11 @@ The "demo" is deliberately two things at once — a **customer-facing multi-agen
 
 ### 1. Customer interaction — the chatbot on Cloudera AI
 
-The customer (Allison Hill, LOW-risk tier, $106K income) asks to upgrade their card. The LangGraph MAS asks two clarifying questions — reason for change, then income — hits the `Clarify turns: 2 / 3` cap, and pitches **Cashback Everyday** (2% cash back, 18.99–25.99% APR). The debug pane on the right shows the graph stage (`offer_presented`), the guardrail's high-risk probability (4.19%), and the selected offer id (`CASHBACK_EVERYDAY`). Thumbs feedback under the reply lands on the correct per-turn `run_id` in LangSmith.
+The customer (Allison Hill, LOW-risk tier, $106K income) asks to upgrade their card. The LangGraph MAS asks two clarifying questions — reason for change, then income — hits the `Clarify turns: 2 / 3` cap, and pitches **Cashback Everyday** (2% cash back, 18.99–25.99% APR). The observability panel on the right shows the graph stage (`offer_presented`), the guardrail's high-risk probability (4.19%), and the selected offer id (`CASHBACK_EVERYDAY`). Thumbs feedback under the reply lands on the correct per-turn `run_id` in LangSmith.
 
 ![NBA chatbot end-to-end interaction on Cloudera AI](img/nba-chat-demo.png)
+
+> **Screenshot out of date.** This image still shows the previous Streamlit UI. The flow and the telemetry it describes are unchanged, but the layout is not — the debug sidebar is now a full observability panel. Re-capture against the current UI when a live Nemotron endpoint is available; the same applies to `img/app-1.png` and the `img/UI-*.png` set.
 
 ### 2. Enterprise observability — the LangSmith trace view
 
@@ -66,7 +68,7 @@ This blueprint implements all three: a **multi-turn LangGraph agent** does the c
 - **👍/👎 feedback** below every assistant reply, written to the correct per-turn `run_id`.
 - **Offline evaluations** (3 notebooks) with deterministic scorers (`correct_offer_selection`, `guardrail_correctness`) and LLM-as-judge scorers (`offer_relevance_llm_judge`, `conversation_quality_llm_judge`) — Nemotron via structured output.
 - **Comparable experiments side-by-side**: temperature sweeps, per-split runs, `num_repetitions` for stability — all as `client.evaluate(...)` calls on the same golden dataset.
-- **Cloudera-native deployment.** Streamlit app hosted as a **Cloudera AI Application**; LLM served by **Cloudera AI Inference Service**; optional ONNX risk classifier served by **CAI Inference** as well.
+- **Cloudera-native deployment.** FastAPI serves the JSON API and the compiled TypeScript client off one port, hosted as a **Cloudera AI Application**; LLM served by **Cloudera AI Inference Service**; optional ONNX risk classifier served by **CAI Inference** as well.
 
 ## Quickstart / Guide
 
@@ -124,9 +126,9 @@ Acceptance targets at temperature 0.2: `correct_offer >= 0.7`, `guardrail_correc
 
 ### Step 5 — Deploy the chatbot and try it live
 
-Launch the Streamlit app as a Cloudera AI Application pointing at **`launch_app.py`** (which boots `app/nba_app.py`).
+Launch the app as a Cloudera AI Application pointing at **`launch_app.py`** (which boots `uvicorn server:app` out of `app/`).
 
-**Pick a customer from the sidebar dropdown** before you start typing. The dropdown is populated at app start from the seeded SQLite `customers` table and covers all three risk tiers (two customers each) — LOW → MED → HIGH. Every entry shows the customer name, risk tier, and annual income so you can see up-front which path the graph will take.
+**Pick a customer from the dropdown in the top bar** before you start typing. The dropdown is populated at app start from the seeded SQLite `customers` table and covers all three risk tiers (two customers each) — LOW → MED → HIGH. Every entry shows the customer name, risk tier, and annual income so you can see up-front which path the graph will take.
 
 Two paths to try:
 
@@ -139,7 +141,7 @@ Scripted turns to send once you've picked a customer:
 
 - **Card upgrade** → *"Hi, I'd like to upgrade my credit card."* → follow the clarifying prompts (income, goal). The bot pitches the best-fit offer.
 - **Post-offer follow-up** → *"What's the annual fee?"* — routes to `post_offer_chat` using the offer already in state.
-- **New conversation** → click **"New conversation"** in the sidebar to start a fresh `thread_id` (the customer stays selected).
+- **New conversation** → click **"New conversation"** in the top bar to start a fresh `thread_id` (the customer stays selected). Switching customer also starts a fresh thread, since the checkpointer would otherwise still hold the previous customer's record.
 
 Every turn is a `run_turn(...)` invocation tagged with `thread_id` metadata, so each conversation shows up as a single thread in LangSmith. The Demo screenshot above is the reference for what a successful "LOW-risk customer, 3-turn conversation ending in an offer" run looks like.
 
@@ -154,13 +156,97 @@ Open your LangSmith project and:
 
 ## Architecture / Software Components
 
-The demo is composed of five Cloudera / third-party components:
+The demo is composed of six Cloudera / third-party components:
 
+- **Web layer** — a hand-written TypeScript client (no framework, no bundler) compiled by `tsc` to browser-native ES modules, served together with the JSON API by **FastAPI/uvicorn** on a single port. A Cloudera AI Application runs one script on one port, so co-serving the API and the assets from one process is what makes it deployable as-is.
 - **LangGraph MAS** — a `StateGraph` compiled with `MemorySaver` checkpointer keyed on `thread_id`. All nodes are `@traceable`, and the whole per-turn invocation is wrapped by `run_turn(...)` which becomes the LangSmith root run for that turn.
 - **Cloudera AI Inference Service — Nemotron LLM endpoint** — powers every LLM step (feature extraction, intent routing, clarifying questions, offer pitches, decline text, and both LLM-as-judge evaluators). OpenAI-compatible.
 - **Cloudera AI Inference Service — ONNX classifier endpoint (optional)** — hosts the customer-risk XGBoost or PyTorch model when the ML guardrail is enabled.
 - **SQLite (`nba_demo.db`)** — offer catalog + synthetic customer PII table. Reachable from both the app and the notebooks because it lives at repo root.
 - **LangSmith** — trace collection, thread grouping, thumbs feedback storage, offline experiments (`client.evaluate(...)`), and optional online evaluators attached in the UI.
+
+### The web layer
+
+The UI is plain TypeScript, HTML and CSS — no framework, no bundler. `tsc`
+emits browser-native ES modules that `index.html` loads with
+`<script type="module">`.
+
+```
+app/web/
+  src/          TypeScript sources
+    api.ts          typed fetch wrappers; interfaces mirror server.py's Pydantic models
+    state.ts        thread_id, transcript, selected customer
+    chat.ts         message rendering, feedback, copy, empty state
+    observability.ts  the right-hand graph-telemetry panel
+    theme.ts        light/dark selection and persistence
+    toast.ts        transient notifications
+    main.ts         wiring and boot
+  static/       COMMITTED build output — this is what FastAPI serves
+    index.html
+    styles.css
+    js/             emitted by tsc; do not hand-edit
+  tsconfig.json
+  package.json  devDependency: typescript only
+```
+
+**The build output is committed on purpose.** A Cloudera AI Application cannot
+be assumed to have Node in its runtime image, so deploying must not require a
+build step. Only someone *changing* the UI needs Node:
+
+```bash
+cd app/web
+npm install     # installs typescript, nothing else
+npm run build   # tsc -> static/js/
+npm run watch   # rebuild on save while developing
+```
+
+Then commit the regenerated `static/js/`.
+
+For local development, run the server directly and open `http://127.0.0.1:8000`:
+
+```bash
+NBA_MOCK=1 uvicorn server:app --app-dir app --port 8000 --reload
+```
+
+`NBA_MOCK=1` stubs the LLM calls, so the whole app runs with no Cloudera
+endpoints and no LangSmith key.
+
+#### Theme
+
+The UI ships light by default and **does not follow the OS setting** — dark is
+something the viewer opts into with the toggle in the top bar, and the choice is
+remembered per-browser in `localStorage`. There is deliberately no
+`prefers-color-scheme` query in `styles.css`; `index.html` applies the stored
+choice from a tiny inline script in `<head>` so the page never flashes the wrong
+theme on reload.
+
+Colours are CSS custom properties defined once on `:root` and redefined under
+`:root[data-theme="dark"]`. The dark steps are chosen against the dark surface
+rather than being an inversion of the light ones.
+
+#### Reading the observability panel
+
+- **High-risk probability** is the hero figure, with a meter beneath it and a
+  tick at `HIGH_RISK_THRESHOLD` (served by `/api/config`). The fill turns red
+  once the probability crosses the tick — the same moment `risk_blocked` flips,
+  so the meter and the Guardrail tile always agree.
+- **Clarify turns** shows discrete segments against the cap; when the cap is
+  reached the graph stops asking questions and forces an offer, so a
+  conversation that "ends early" is the cap firing rather than a bug.
+- Status is always a coloured dot **plus** a word, never colour alone.
+
+### API surface
+
+`app/server.py` exposes the agent over HTTP, which makes it reusable by
+anything that speaks JSON, not just this UI. Interactive docs are at `/docs`.
+
+| Route | Purpose |
+|---|---|
+| `GET /api/config` | LangSmith org/project, the clarify cap and the guardrail threshold, fetched once on load |
+| `GET /api/customers` | Demo customer slate spanning LOW / MED / HIGH risk tiers |
+| `POST /api/turn` | `{message, thread_id, customer_id}` → one `run_turn(...)`, i.e. one LangSmith root run |
+| `POST /api/feedback` | `{run_id, score}` → thumbs feedback on that turn's root run |
+| `GET /healthz` | Liveness |
 
 ### Runtime data flow
 
@@ -171,7 +257,7 @@ The demo is composed of five Cloudera / third-party components:
                      │                     └──────────────────┘   pitch, judge)
                      │
    user turn ──►  intake ──► risk_guardrail ──(low)──► intent_router ─┬──► clarify ──► END
-   (Streamlit)                     │                                   ├──► offer_selection ──► offer_presentation ──► END
+   (browser)                      │                                   ├──► offer_selection ──► offer_presentation ──► END
                                    │                                   └──► post_offer_chat ──► END
                                    └──(high)──► decline ──► END
                                           │
@@ -260,7 +346,7 @@ That writes `img/nba_graph.mmd` and prints the same Mermaid text you see in the 
 LangSmith is the observability plane of this blueprint. It answers two very different questions that a bank running an agentic chatbot has to answer at the same time:
 
 - **Offline — "is a proposed change safe to ship?"** — grade a fixed golden set of scripted conversations against deterministic and LLM-as-judge scorers; run experiments side-by-side; compare a new prompt or temperature against a baseline before any user sees it.
-- **Online — "what is production actually doing right now?"** — every live turn from the Streamlit app is a traced root run, grouped by conversation, with per-turn thumbs feedback and (optionally) auto-evaluators sampling live traffic.
+- **Online — "what is production actually doing right now?"** — every live turn from the web app is a traced root run, grouped by conversation, with per-turn thumbs feedback and (optionally) auto-evaluators sampling live traffic.
 
 Both paths reuse the same graph (`app/nba_app.py:run_turn`) and the same evaluators (`nba_evaluators.ipynb`), so a scorer you trust offline is the same scorer you can attach to live traffic.
 
@@ -268,8 +354,8 @@ Both paths reuse the same graph (`app/nba_app.py:run_turn`) and the same evaluat
 
 - **Root run per turn.** `run_turn(...)` in `app/nba_app.py` is decorated with `@traceable`. Every user message becomes one root run named `nba_turn` in the `LANGSMITH_PROJECT` project. All LangGraph nodes it invokes (`intake`, `risk_guardrail`, `intent_router`, `clarify`, `select_offer`, `offer_presentation`, `post_offer_chat`, `decline`) show up as nested runs under it, with their own inputs, outputs, latency, and token counts.
 - **Thread grouping.** Each root run is tagged with `thread_id` metadata (the same key that drives LangGraph's `MemorySaver` checkpointer). LangSmith's **Threads** tab uses that tag to fold every turn of a conversation into a single, scrollable thread — mirroring what the customer actually experienced.
-- **Per-turn feedback.** The 👍/👎 buttons under each assistant reply in the Streamlit app call `Client().create_feedback(run_id, key="user_thumbs", score=1|0)`, where `run_id` is the current turn's root — so feedback attaches to the specific turn, not the whole conversation, which is what makes the signal useful for downstream evaluators.
-- **Sidebar link.** The Streamlit sidebar renders a direct link to the current thread in LangSmith, so a support / QA operator can jump from a customer complaint to the full trace in one click.
+- **Per-turn feedback.** The 👍/👎 buttons under each assistant reply POST to `/api/feedback`, which calls `Client().create_feedback(run_id, key="user_thumbs", score=1|0)`, where `run_id` is the current turn's root — so feedback attaches to the specific turn, not the whole conversation, which is what makes the signal useful for downstream evaluators.
+- **Thread link.** The observability panel renders a direct link to the current thread in LangSmith, so a support / QA operator can jump from a customer complaint to the full trace in one click.
 
 ### Offline evaluation
 
@@ -293,10 +379,10 @@ Because the target function calls the real `run_turn`, every offline example als
 
 ### Online monitoring
 
-Once the Streamlit app is deployed as a Cloudera AI Application, the same tracing is on by default:
+Once the app is deployed as a Cloudera AI Application, the same tracing is on by default:
 
 - **Traces.** Every `run_turn` is a root run in `LANGSMITH_PROJECT`. Screenshots 2 and 3 in the Demo section above show the list view and the per-turn waterfall.
-- **Threads.** LangSmith's Threads tab groups every turn sharing the same `thread_id` metadata into one conversation view. The Streamlit sidebar renders a direct link.
+- **Threads.** LangSmith's Threads tab groups every turn sharing the same `thread_id` metadata into one conversation view. The observability panel renders a direct link.
 - **Feedback.** 👍/👎 buttons below every assistant reply land on the correct per-turn `run_id`. Feedback rate is directly queryable and dashboardable in LangSmith.
 - **Optional online evaluators.** In LangSmith UI → project settings → *Auto-evaluators*, attach `offer_relevance_llm_judge` (or a toxicity check) to run on a sample of production traces. UI-configured, no code changes required.
 
@@ -321,7 +407,10 @@ The chatbot on its own is a demo. The reason this blueprint is a *blueprint* is 
 
 | Path | Description |
 |---|---|
-| `app/nba_app.py` | LangGraph chatbot + Streamlit UI. Hosts `_rules_based_risk_score`, the current placeholder guardrail. |
+| `app/nba_app.py` | The LangGraph agent: nodes, graph wiring, and `run_turn`. UI-agnostic. Hosts `_rules_based_risk_score`, the current placeholder guardrail. |
+| `app/server.py` | FastAPI layer — JSON API over `run_turn` plus static hosting for the compiled client. |
+| `app/web/src/*.ts` | TypeScript client sources (chat, observability panel, API wrappers). |
+| `app/web/static/` | **Committed build output** — `index.html`, `styles.css`, and `js/` emitted by `tsc`. This is what the server serves. |
 | `app/db.py` | SQLite schema + offer seeding (DB file `nba_demo.db` sits at the project root so both the app and the notebooks can reach it). |
 | `app/offer_rules.py` | Rule-engine (SQL filter + Python re-scoring). |
 | `app/pii_datagen.py` | Faker-based customer seeder (`--ensure`, `--rows`). |
@@ -356,6 +445,9 @@ The chatbot on its own is a demo. The reason this blueprint is a *blueprint* is 
 - Python 3.10+ (already provided by CAI runtimes).
 - `git`.
 - Python packages from `requirements.txt` (installed inside the CAI session).
+- **Node 18+ — only if you intend to modify the UI.** The compiled client is
+  committed under `app/web/static/`, so running and deploying the blueprint
+  needs Python alone. See [The web layer](#the-web-layer).
 
 **Configuration.** Copy `.env.example` to `.env` and fill in:
 
@@ -383,7 +475,9 @@ The chatbot on its own is a demo. The reason this blueprint is a *blueprint* is 
 2. **Set env vars** on the Application (or in a session's project env vars) — everything from the table above.
 3. **Launch as an Application** pointing at `launch_app.py`. On boot it will:
    - run `python /home/cdsw/app/pii_datagen.py --ensure` to create `nba_demo.db` at the project root and seed offers + customers (idempotent — no-op on restart);
-   - then `streamlit run /home/cdsw/app/nba_app.py --server.port $CDSW_READONLY_PORT --server.address 127.0.0.1`.
+   - then `uvicorn server:app --app-dir /home/cdsw/app --host 127.0.0.1 --port $CDSW_READONLY_PORT`.
+
+   No Node is needed at deploy time: `app/web/static/js/` is committed, so the runtime only serves it.
 4. **Open the app URL** and chat.
 
 ## Hardware Requirements

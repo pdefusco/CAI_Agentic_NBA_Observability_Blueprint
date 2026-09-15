@@ -30,7 +30,8 @@ tags:
   - chatbot
   - guardrails
   - onnx
-  - streamlit
+  - typescript
+  - fastapi
   - retail-banking
 
 # --- Relationships ---
