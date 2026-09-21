@@ -1,5 +1,11 @@
 # NBA Chatbot — Evaluated, Observed Multi-Agent Apps on Cloudera AI with LangSmith
 
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](requirements.txt)
+[![Cloudera Blueprint](https://img.shields.io/badge/Cloudera-Blueprint-f96702.svg)](METADATA.yaml)
+[![Stars](https://img.shields.io/github/stars/pdefusco/CAI_Agentic_NBA_Observability_Blueprint?logo=github)](https://github.com/pdefusco/CAI_Agentic_NBA_Observability_Blueprint/stargazers)
+[![Forks](https://img.shields.io/github/forks/pdefusco/CAI_Agentic_NBA_Observability_Blueprint?logo=github)](https://github.com/pdefusco/CAI_Agentic_NBA_Observability_Blueprint/network/members)
+
 <p align="center">
   <img src="img/icon.png" alt="NBA Chatbot" width="480" />
 </p>
@@ -529,3 +535,13 @@ The rules-based `_rules_based_risk_score` in `app/nba_app.py` is a placeholder. 
 - [Cloudera AI Inference Service documentation](https://docs.cloudera.com/machine-learning/cloud/ai-inference/index.html)
 - [LangGraph documentation](https://langchain-ai.github.io/langgraph/)
 - [LangSmith documentation](https://docs.smith.langchain.com/)
+
+
+
+## License
+
+This project is licensed under the [Apache License 2.0](LICENSE).
+
+## Disclaimer
+
+*This blueprint is intended for Proof-of-Concept and research use only. It is not designed for production deployment. Use in production environments is at the user's own risk. The authors and contributors accept no liability for operational impacts or damages.*
