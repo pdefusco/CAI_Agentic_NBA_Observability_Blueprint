@@ -1,4 +1,9 @@
-# Cloudera Blueprint: NBA Chatbot — Evaluated, Observed Multi-Agent Apps on Cloudera AI with LangSmith
+# NBA Chatbot — Evaluated, Observed Multi-Agent Apps on Cloudera AI with LangSmith
+
+<p align="center">
+  <img src="img/icon.png" alt="NBA Chatbot" width="480" />
+</p>
+
 
 > A reusable blueprint for building a **Next-Best-Action** credit-card recommender as a **multi-turn chatbot** on **Cloudera AI**, powered by a **LangGraph** multi-agent workflow, guarded by a customer-risk check, and fully instrumented with **LangSmith** for offline evaluation and online monitoring.
 
