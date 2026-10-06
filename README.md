@@ -167,6 +167,8 @@ Open your LangSmith project and:
 
 ## Architecture / Software Components
 
+![NBA chatbot architecture — LangGraph nodes, the risk guardrail and its optional ML path, the CAI Nemotron LLM endpoint, and the intent fan-out to clarify, offer and post-offer paths](img/new_arch.png)
+
 The demo is composed of six Cloudera / third-party components:
 
 - **Web layer** — a hand-written TypeScript client (no framework, no bundler) compiled by `tsc` to browser-native ES modules, served together with the JSON API by **FastAPI/uvicorn** on a single port. A Cloudera AI Application runs one script on one port, so co-serving the API and the assets from one process is what makes it deployable as-is.
