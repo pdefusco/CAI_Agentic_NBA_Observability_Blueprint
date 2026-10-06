@@ -42,11 +42,9 @@ The "demo" is deliberately two things at once — a **customer-facing multi-agen
 
 ### 1. Customer interaction — the chatbot on Cloudera AI
 
-The customer (Allison Hill, LOW-risk tier, $106K income) asks to upgrade their card. The LangGraph MAS asks two clarifying questions — reason for change, then income — hits the `Clarify turns: 2 / 3` cap, and pitches **Cashback Everyday** (2% cash back, 18.99–25.99% APR). The observability panel on the right shows the graph stage (`offer_presented`), the guardrail's high-risk probability (4.19%), and the selected offer id (`CASHBACK_EVERYDAY`). Thumbs feedback under the reply lands on the correct per-turn `run_id` in LangSmith.
+The customer (Allison Hill, LOW-risk tier, $106K income) asks to upgrade their card. The LangGraph MAS asks three clarifying questions — what matters most in a new card, which kind of rewards, then income and credit score — hits the `Clarify turns: 3 / 3` cap, and pitches **Cashback Everyday** (2% cash back, 18.99–25.99% APR). The observability panel on the right shows the graph stage (`offer_presented`), the guardrail's high-risk probability (4.19%), and the selected offer id (`CASHBACK_EVERYDAY`). Thumbs feedback under the reply lands on the correct per-turn `run_id` in LangSmith.
 
-![NBA chatbot end-to-end interaction on Cloudera AI](img/nba-chat-demo.png)
-
-> **Screenshot out of date.** This image still shows the previous Streamlit UI. The flow and the telemetry it describes are unchanged, but the layout is not — the debug sidebar is now a full observability panel. Re-capture against the current UI when a live Nemotron endpoint is available; the same applies to `img/app-1.png` and the `img/UI-*.png` set.
+![NBA chatbot end-to-end interaction on Cloudera AI](img/nba-conversation.png)
 
 ### 2. Enterprise observability — the LangSmith trace view
 
